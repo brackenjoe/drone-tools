@@ -1,0 +1,824 @@
+{
+ "from": "Copter-4.6.3",
+ "to": "Copter-4.7.1",
+ "to_commit": "dbe792162d06cab66c3475fd5556bf7a120f119e",
+ "note": "Parameter renames between ArduCopter 4.6.3 and 4.7.1, for ap-upgrade-verify.py --renames. factor converts an old value to the new scale: new = old * factor. Factors are read off the 4.7.1 source conversion code, not the metadata units field, which does not record every scale change (PSC_ACCZ_P/I/D, PSC_ACCZ_IMAX and PSC_VELZ_IMAX scale by 0.1, 0.001 and 0.01 with no unit change). The how field of each row says how it was established: a conversion table (file and line), a conversion in place, or a rename in place. Three rows were not checked and say so. A rename in place keeps its storage slot, so its factor is 1. unit_old and unit_new are the metadata units at each version, for reading only. The 4.7.1 description of PSC_D_ACC_FF says it is PSC_ACCZ_FF * 0.1, but its conversion table copies it unscaled; this map follows the table.",
+ "renames": [
+  {
+   "old": "ANGLE_MAX",
+   "new": "ATC_ANGLE_MAX",
+   "factor": 0.01,
+   "unit_old": "cdeg",
+   "unit_new": "deg",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_AttitudeControl.cpp:1185"
+  },
+  {
+   "old": "AROT_FW_V_P",
+   "new": "AROT_FWD_P",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "not checked: helicopter autorotation, absent from a multirotor build; factor assumed 1"
+  },
+  {
+   "old": "ATC_ACCEL_P_MAX",
+   "new": "ATC_ACC_P_MAX",
+   "factor": 0.01,
+   "unit_old": "cdeg/s/s",
+   "unit_new": "deg/s/s",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_AttitudeControl.cpp:1189"
+  },
+  {
+   "old": "ATC_ACCEL_R_MAX",
+   "new": "ATC_ACC_R_MAX",
+   "factor": 0.01,
+   "unit_old": "cdeg/s/s",
+   "unit_new": "deg/s/s",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_AttitudeControl.cpp:1188"
+  },
+  {
+   "old": "ATC_ACCEL_Y_MAX",
+   "new": "ATC_ACC_Y_MAX",
+   "factor": 0.01,
+   "unit_old": "cdeg/s/s",
+   "unit_new": "deg/s/s",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_AttitudeControl.cpp:1187"
+  },
+  {
+   "old": "ATC_SLEW_YAW",
+   "new": "ATC_RATE_WPY_MAX",
+   "factor": 0.01,
+   "unit_old": "cdeg/s",
+   "unit_new": "deg/s",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_AttitudeControl.cpp:1186"
+  },
+  {
+   "old": "AVOID_ANGLE_MAX",
+   "new": "AVOID_ANG_MAX",
+   "factor": 0.01,
+   "unit_old": "cdeg",
+   "unit_new": "deg",
+   "how": "conversion table, libraries/AC_Avoidance/AC_Avoid.cpp:150"
+  },
+  {
+   "old": "CIRCLE_RADIUS",
+   "new": "CIRCLE_RADIUS_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, libraries/AC_WPNav/AC_Circle.cpp:482"
+  },
+  {
+   "old": "EK3_MAX_FLOW",
+   "new": "EK3_FLOW_MAX",
+   "factor": 1.0,
+   "unit_old": "rad/s",
+   "unit_new": "rad/s",
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "LAND_ALT_LOW",
+   "new": "LAND_ALT_LOW_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, ArduCopter/mode_land.cpp:56"
+  },
+  {
+   "old": "LAND_SPEED",
+   "new": "LAND_SPD_MS",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, ArduCopter/mode_land.cpp:54"
+  },
+  {
+   "old": "LAND_SPEED_HIGH",
+   "new": "LAND_SPD_HIGH_MS",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, ArduCopter/mode_land.cpp:55"
+  },
+  {
+   "old": "LOIT_ACC_MAX",
+   "new": "LOIT_ACC_MAX_M",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_Loiter.cpp:284"
+  },
+  {
+   "old": "LOIT_BRK_ACCEL",
+   "new": "LOIT_BRK_ACC_M",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_Loiter.cpp:285"
+  },
+  {
+   "old": "LOIT_BRK_JERK",
+   "new": "LOIT_BRK_JRK_M",
+   "factor": 0.01,
+   "unit_old": "cm/s/s/s",
+   "unit_new": "m/s/s/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_Loiter.cpp:286"
+  },
+  {
+   "old": "LOIT_SPEED",
+   "new": "LOIT_SPEED_MS",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_Loiter.cpp:283"
+  },
+  {
+   "old": "PHLD_BRAKE_ANGLE",
+   "new": "PHLD_BRK_ANGLE",
+   "factor": 0.01,
+   "unit_old": "cdeg",
+   "unit_new": "deg",
+   "how": "conversion table, ArduCopter/mode_poshold.cpp:65"
+  },
+  {
+   "old": "PHLD_BRAKE_RATE",
+   "new": "PHLD_BRK_RATE",
+   "factor": 1.0,
+   "unit_old": "deg/s",
+   "unit_new": "deg/s",
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "PILOT_ACCEL_Z",
+   "new": "PILOT_ACC_Z",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, ArduCopter/Parameters.cpp:1328"
+  },
+  {
+   "old": "PILOT_SPEED_DN",
+   "new": "PILOT_SPD_DN",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, ArduCopter/Parameters.cpp:1330"
+  },
+  {
+   "old": "PILOT_SPEED_UP",
+   "new": "PILOT_SPD_UP",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, ArduCopter/Parameters.cpp:1327"
+  },
+  {
+   "old": "PILOT_TKOFF_ALT",
+   "new": "PILOT_TKO_ALT_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, ArduCopter/Parameters.cpp:1329"
+  },
+  {
+   "old": "PSC_ACCZ_D",
+   "new": "PSC_D_ACC_D",
+   "factor": 0.1,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1888"
+  },
+  {
+   "old": "PSC_ACCZ_D_FF",
+   "new": "PSC_D_ACC_D_FF",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1864"
+  },
+  {
+   "old": "PSC_ACCZ_FF",
+   "new": "PSC_D_ACC_FF",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1858"
+  },
+  {
+   "old": "PSC_ACCZ_FLTD",
+   "new": "PSC_D_ACC_FLTD",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1861"
+  },
+  {
+   "old": "PSC_ACCZ_FLTE",
+   "new": "PSC_D_ACC_FLTE",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1860"
+  },
+  {
+   "old": "PSC_ACCZ_FLTT",
+   "new": "PSC_D_ACC_FLTT",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1859"
+  },
+  {
+   "old": "PSC_ACCZ_I",
+   "new": "PSC_D_ACC_I",
+   "factor": 0.1,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1887"
+  },
+  {
+   "old": "PSC_ACCZ_IMAX",
+   "new": "PSC_D_ACC_IMAX",
+   "factor": 0.001,
+   "unit_old": "d%",
+   "unit_new": "d%",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1915"
+  },
+  {
+   "old": "PSC_ACCZ_NEF",
+   "new": "PSC_D_ACC_NEF",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1865"
+  },
+  {
+   "old": "PSC_ACCZ_NTF",
+   "new": "PSC_D_ACC_NTF",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1866"
+  },
+  {
+   "old": "PSC_ACCZ_P",
+   "new": "PSC_D_ACC_P",
+   "factor": 0.1,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1886"
+  },
+  {
+   "old": "PSC_ACCZ_PDMX",
+   "new": "PSC_D_ACC_PDMX",
+   "factor": 1.0,
+   "unit_old": "d%",
+   "unit_new": "d%",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1863"
+  },
+  {
+   "old": "PSC_ACCZ_SMAX",
+   "new": "PSC_D_ACC_SMAX",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1862"
+  },
+  {
+   "old": "PSC_JERK_XY",
+   "new": "PSC_NE_JERK",
+   "factor": 1.0,
+   "unit_old": "m/s/s/s",
+   "unit_new": "m/s/s/s",
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "PSC_JERK_Z",
+   "new": "PSC_D_JERK",
+   "factor": 1.0,
+   "unit_old": "m/s/s/s",
+   "unit_new": "m/s/s/s",
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "PSC_POSXY_P",
+   "new": "PSC_NE_POS_P",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "PSC_POSZ_P",
+   "new": "PSC_D_POS_P",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "PSC_VELXY_D",
+   "new": "PSC_NE_VEL_D",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1869"
+  },
+  {
+   "old": "PSC_VELXY_FF",
+   "new": "PSC_NE_VEL_FF",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1872"
+  },
+  {
+   "old": "PSC_VELXY_FLTD",
+   "new": "PSC_NE_VEL_FLTD",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1871"
+  },
+  {
+   "old": "PSC_VELXY_FLTE",
+   "new": "PSC_NE_VEL_FLTE",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, ArduCopter/Parameters.cpp:1344"
+  },
+  {
+   "old": "PSC_VELXY_I",
+   "new": "PSC_NE_VEL_I",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1868"
+  },
+  {
+   "old": "PSC_VELXY_IMAX",
+   "new": "PSC_NE_VEL_IMAX",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1905"
+  },
+  {
+   "old": "PSC_VELXY_P",
+   "new": "PSC_NE_VEL_P",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1867"
+  },
+  {
+   "old": "PSC_VELZ_D",
+   "new": "PSC_D_VEL_D",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1854"
+  },
+  {
+   "old": "PSC_VELZ_FF",
+   "new": "PSC_D_VEL_FF",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1857"
+  },
+  {
+   "old": "PSC_VELZ_FLTD",
+   "new": "PSC_D_VEL_FLTD",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1856"
+  },
+  {
+   "old": "PSC_VELZ_FLTE",
+   "new": "PSC_D_VEL_FLTE",
+   "factor": 1.0,
+   "unit_old": "Hz",
+   "unit_new": "Hz",
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1855"
+  },
+  {
+   "old": "PSC_VELZ_I",
+   "new": "PSC_D_VEL_I",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1853"
+  },
+  {
+   "old": "PSC_VELZ_IMAX",
+   "new": "PSC_D_VEL_IMAX",
+   "factor": 0.01,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1904"
+  },
+  {
+   "old": "PSC_VELZ_P",
+   "new": "PSC_D_VEL_P",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, libraries/AC_AttitudeControl/AC_PosControl.cpp:1852"
+  },
+  {
+   "old": "RNGFND1_GNDCLEAR",
+   "new": "RNGFND1_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND1_MAX_CM",
+   "new": "RNGFND1_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND1_MIN_CM",
+   "new": "RNGFND1_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND2_GNDCLEAR",
+   "new": "RNGFND2_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND2_MAX_CM",
+   "new": "RNGFND2_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND2_MIN_CM",
+   "new": "RNGFND2_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND3_GNDCLEAR",
+   "new": "RNGFND3_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND3_MAX_CM",
+   "new": "RNGFND3_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND3_MIN_CM",
+   "new": "RNGFND3_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND4_GNDCLEAR",
+   "new": "RNGFND4_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND4_MAX_CM",
+   "new": "RNGFND4_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND4_MIN_CM",
+   "new": "RNGFND4_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND5_GNDCLEAR",
+   "new": "RNGFND5_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND5_MAX_CM",
+   "new": "RNGFND5_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND5_MIN_CM",
+   "new": "RNGFND5_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND6_GNDCLEAR",
+   "new": "RNGFND6_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND6_MAX_CM",
+   "new": "RNGFND6_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND6_MIN_CM",
+   "new": "RNGFND6_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND7_GNDCLEAR",
+   "new": "RNGFND7_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND7_MAX_CM",
+   "new": "RNGFND7_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND7_MIN_CM",
+   "new": "RNGFND7_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND8_GNDCLEAR",
+   "new": "RNGFND8_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND8_MAX_CM",
+   "new": "RNGFND8_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND8_MIN_CM",
+   "new": "RNGFND8_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND9_GNDCLEAR",
+   "new": "RNGFND9_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND9_MAX_CM",
+   "new": "RNGFND9_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFND9_MIN_CM",
+   "new": "RNGFND9_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFNDA_GNDCLEAR",
+   "new": "RNGFNDA_GNDCLR",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFNDA_MAX_CM",
+   "new": "RNGFNDA_MAX",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RNGFNDA_MIN_CM",
+   "new": "RNGFNDA_MIN",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "converted in place, libraries/AP_RangeFinder/AP_RangeFinder_Params.cpp:199-201"
+  },
+  {
+   "old": "RTL_ALT",
+   "new": "RTL_ALT_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, ArduCopter/mode_rtl.cpp:65"
+  },
+  {
+   "old": "RTL_ALT_FINAL",
+   "new": "RTL_ALT_FINAL_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, ArduCopter/mode_rtl.cpp:67"
+  },
+  {
+   "old": "RTL_CLIMB_MIN",
+   "new": "RTL_CLIMB_MIN_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, ArduCopter/mode_rtl.cpp:68"
+  },
+  {
+   "old": "RTL_SPEED",
+   "new": "RTL_SPEED_MS",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, ArduCopter/mode_rtl.cpp:66"
+  },
+  {
+   "old": "SIM_PLD_ALT_LIMIT",
+   "new": "SIM_PLD_ALT_LMT",
+   "factor": 1.0,
+   "unit_old": "m",
+   "unit_new": "m",
+   "how": "not checked: SITL-only parameter; factor assumed 1"
+  },
+  {
+   "old": "SIM_PLD_DIST_LIMIT",
+   "new": "SIM_PLD_DIST_LMT",
+   "factor": 1.0,
+   "unit_old": "m",
+   "unit_new": "m",
+   "how": "not checked: SITL-only parameter; factor assumed 1"
+  },
+  {
+   "old": "SYSID_MYGCS",
+   "new": "MAV_GCS_SYSID",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, ArduCopter/Parameters.cpp:1297"
+  },
+  {
+   "old": "SYSID_THISMAV",
+   "new": "MAV_SYSID",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "conversion table, ArduCopter/Parameters.cpp:1296"
+  },
+  {
+   "old": "TELEM_DELAY",
+   "new": "MAV_TELEM_DELAY",
+   "factor": 1.0,
+   "unit_old": "s",
+   "unit_new": "s",
+   "how": "conversion table, ArduCopter/Parameters.cpp:1299"
+  },
+  {
+   "old": "WPNAV_ACCEL",
+   "new": "WP_ACC",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:145"
+  },
+  {
+   "old": "WPNAV_ACCEL_C",
+   "new": "WP_ACC_CNR",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:147"
+  },
+  {
+   "old": "WPNAV_ACCEL_Z",
+   "new": "WP_ACC_Z",
+   "factor": 0.01,
+   "unit_old": "cm/s/s",
+   "unit_new": "m/s/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:146"
+  },
+  {
+   "old": "WPNAV_JERK",
+   "new": "WP_JERK",
+   "factor": 1.0,
+   "unit_old": "m/s/s/s",
+   "unit_new": "m/s/s/s",
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "WPNAV_RADIUS",
+   "new": "WP_RADIUS_M",
+   "factor": 0.01,
+   "unit_old": "cm",
+   "unit_new": "m",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:142"
+  },
+  {
+   "old": "WPNAV_RFND_USE",
+   "new": "WP_RFND_USE",
+   "factor": 1.0,
+   "unit_old": null,
+   "unit_new": null,
+   "how": "renamed in place (same storage key and index)"
+  },
+  {
+   "old": "WPNAV_SPEED",
+   "new": "WP_SPD",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:141"
+  },
+  {
+   "old": "WPNAV_SPEED_DN",
+   "new": "WP_SPD_DN",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:144"
+  },
+  {
+   "old": "WPNAV_SPEED_UP",
+   "new": "WP_SPD_UP",
+   "factor": 0.01,
+   "unit_old": "cm/s",
+   "unit_new": "m/s",
+   "how": "conversion table, libraries/AC_WPNav/AC_WPNav.cpp:143"
+  },
+  {
+   "old": "WPNAV_TER_MARGIN",
+   "new": "WP_TER_MARGIN",
+   "factor": 1.0,
+   "unit_old": "m",
+   "unit_new": "m",
+   "how": "renamed in place (same storage key and index)"
+  }
+ ]
+}
