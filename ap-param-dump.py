@@ -54,12 +54,16 @@ written, with a loud line); 2 bad arguments.
 
 Read-only against the vehicle: it requests, it never sets or saves.
 """
-import argparse, glob, importlib.util, os, struct, sys, time
+import argparse, glob, importlib.util, math, os, re, struct, sys, tempfile, time
 
 ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
 ap.add_argument('out', help='where to write the parameter values')
 ap.add_argument('--defaults', help='where to write the board defaults')
-ap.add_argument('--health', help='where to write a sensor/PreArm snapshot')
+ap.add_argument('--health', help='where to write a sensor/PreArm snapshot. The file is '
+                'meant to be shared, so it leaves out the GPS position unless '
+                '--health-position is given')
+ap.add_argument('--health-position', action='store_true',
+                help='also write the GPS latitude and longitude into the --health file')
 ap.add_argument('--device', default=None,
                 help='default: the first /dev/serial/by-id/*ArduPilot* device, '
                      'else /dev/ttyACM0 if it exists')
@@ -150,15 +154,49 @@ def find_device():
     sys.exit("no flight controller found; pass --device")
 
 
+def inert(s):
+    """s with every C0 control, DEL and C1 control as \\xNN, so text from the
+    vehicle cannot move the cursor, recolour the terminal or start a new line."""
+    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+
+
+_NAME_OK = re.compile(r'[A-Z0-9_]{1,16}\Z')
+
+
+def check_pairs(pairs):
+    """Exit 1, before anything is written, on a name that is not a parameter
+    name or a value that is not a finite number."""
+    for name, value in pairs.items():
+        if not _NAME_OK.match(name):
+            sys.exit(f"REFUSED: parameter name '{inert(name)}' from the vehicle is not "
+                     f"1-16 characters of A-Z, 0-9 and _; nothing written")
+        if not math.isfinite(value):
+            sys.exit(f"REFUSED: parameter {name} has the non-finite value {value}; nothing written")
+
+
 def write_param_file(path, pairs):
     """Mission Planner format. repr() on the float keeps every bit that came
-    off the wire; '%f' would silently round a gain to 6 decimals."""
-    with open(path, 'w') as f:
-        for name, value in sorted(pairs.items()):
-            if value == int(value) and abs(value) < 1e9:
-                f.write(f"{name},{int(value)}\n")
-            else:
-                f.write(f"{name},{repr(float(value))}\n")
+    off the wire; '%f' would silently round a gain to 6 decimals. Written to a
+    temporary file beside the target and renamed over it, so a refusal or a
+    failure never leaves a truncated file."""
+    check_pairs(pairs)
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix='.param-dump-', dir=d)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            for name, value in sorted(pairs.items()):
+                if value == int(value) and abs(value) < 1e9:
+                    f.write(f"{name},{int(value)}\n")
+                else:
+                    f.write(f"{name},{repr(float(value))}\n")
+        um = os.umask(0)
+        os.umask(um)
+        os.chmod(tmp, 0o666 & ~um)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     print(f"  wrote {len(pairs)} to {path}")
 
 
@@ -250,6 +288,7 @@ def snapshot_health(m, path, secs):
     MAVProxy's 'arm check' is not used because that writes ARMING_CHECK."""
     out = []
     def say(s):
+        s = inert(s)
         print(f"  {s}")
         out.append(s)
 
@@ -305,8 +344,9 @@ def snapshot_health(m, path, secs):
 
     g = seen.get('GPS_RAW_INT')
     if g:
+        pos = f" lat={g.lat} lon={g.lon}" if a.health_position else ""
         say(f"GPS fix_type={g.fix_type} satellites={g.satellites_visible} "
-            f"hdop={g.eph} lat={g.lat} lon={g.lon}")
+            f"hdop={g.eph}{pos}")
     else:
         say("GPS: no GPS_RAW_INT received")
 
@@ -366,6 +406,9 @@ def main():
             print("  WARNING: --defaults requested but MAVFTP failed; "
                   "no defaults file written")
 
+    check_pairs(values)
+    if defaults:
+        check_pairs(defaults)
     write_param_file(a.out, values)
     if a.defaults and defaults:
         write_param_file(a.defaults, defaults)

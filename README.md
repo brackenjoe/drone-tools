@@ -67,13 +67,27 @@ back short, it still writes the file and exits 1. It picks its board the
 same way as `ap-param-apply.py` (below), and refuses before reading anything
 if two boards answer at one system id, since it would mix their
 parameters. `--health FILE` adds
-a snapshot of sensors, GPS, RC and the PreArm checks.
+a snapshot meant to be shared when you ask for help. It holds the firmware
+version and git hash, the board version, the sensor health bits, the RC
+channel count, rssi and the first 8 channels, the raw compass readings, the
+GPS fix type, satellites and HDOP, and every status message seen during
+`--health-secs` (default 60 s). It leaves out the vehicle's position unless you add
+`--health-position`. Status messages can carry identifying text, such as a
+board serial in a startup banner, so read the file before you post it. Text
+from the vehicle is shown with control characters as `\xNN`, so one
+message stays one line. If a parameter name or value would not make a valid
+file, the run exits 1 and writes nothing. The `.param` and `.defaults` files
+are written to a temporary file and then renamed, so an existing one is
+never left half-written.
 
 `ap-upgrade-verify.py` exits 1 on any MISMATCH (a value not carried
 across) or UNEXPLAINED change outside the table, else 0. A row whose name
 is missing from either dump is reported as NOT COMPARABLE and does not
 fail the run: on an aircraft without a rangefinder, say, those rows are
-expected. Read them. A rename table is JSON,
+expected. Read them. A line whose value is not a number, including `nan`
+or `inf`, is skipped and counted, and a nonzero count is printed; it does not
+fail the run, so a renamed parameter with such a value shows as NOT
+COMPARABLE. A rename table is JSON,
 `{"renames": [{"old": ..., "new": ..., "factor": ...}]}`, with
 `new = old * factor`. Take factors from the firmware's conversion code, not
 from the metadata units field: between Copter 4.6.3 and 4.7.1, five
@@ -95,7 +109,17 @@ checked and say so. It was used to verify two real upgrades.
 `identify` and `plan` are read-only; `plan` prints what `write` would
 change. `write` prints every change and logs every line with `--log`.
 `write` and `reboot` refuse while armed, and on any mismatch of the pins.
-`--expect-git` is compared as an 8-character prefix of the firmware hash.
+`write` checks again just before the first write, and before each one it
+looks at the vehicle's latest heartbeats. If the vehicle arms during the
+write, it stops, says how many names it wrote and which was next, and
+exits 1. It knows the armed state only from heartbeats, about one a second,
+so on any link up to about a second of writes can go out after the vehicle
+arms (4 measured on a link with 150 ms delay each way, 20 on loopback).
+After the last write it checks once more and, if the vehicle is armed or
+no heartbeat comes, it warns, says how many writes were made and exits 1.
+A write already sent cannot be undone.
+`--expect-git` is compared as an 8-character prefix of the firmware hash,
+which is shown with anything other than letters and digits as `?`.
 A `never-write.txt` beside a parameter file lists names or patterns that
 no file may set.
 
@@ -176,6 +200,26 @@ written with firmware warnings; 2 no link or a timeout.
 
 `run` refuses `save`, `defaults`, `bl`, `dfu`, `exit`, `flash_erase`,
 `msc`, `motor`, `escprog`, `serialpassthrough` and `gpspassthrough`.
+The Betaflight CLI edits a line before running it. It ends the line at a
+newline, drops other control characters, treats DEL as backspace,
+completes a command on `?` or tab, exits on Ctrl-D at the start of a line,
+and cuts the line at `#`. So `run` and `restore` refuse any line that holds
+a character outside printable ASCII, a `?` or a `#` (a whole-line `#`
+comment in a file is skipped), before anything is sent. Then the first word
+is the command the board will run. `restore` also accepts only the commands
+a `diff all` contains (`set`, `feature`, `serial`, `aux`, `resource`,
+`mixer` and the like), so a `dump`, a hand-edited file or a file with other
+commands is refused whole. It does not judge the settings themselves: a
+file of plain `set` and `resource` lines from someone else can still
+reconfigure motors, ports and failsafe, and `--save` keeps it, so read a
+file before you restore it. The board and version check compares the
+file's own header, which is plain text. This behaviour of the CLI was read
+from Betaflight 2026.6.2's source and measured on its SITL, not on a board;
+the cut at `#` was read from the source only. Older firmware was not
+checked, and a diff from another version may hold a command that is not on
+the list; it is then refused. Text from the board is printed, and written into
+backup headers, with control characters as `\xNN`. `bf-cli.py --selftest`
+runs the gate's cases offline.
 `restore` first backs up the current config beside the given file.
 On firmware before 2025.12 every command ends in a reboot, because `exit`
 always reboots there; the tool reads the version and says so.

@@ -60,7 +60,15 @@ timed out waiting for the prompt.
 `run` refuses, before connecting, any line whose first word is save, defaults,
 bl, dfu, exit, flash_erase, msc, motor, escprog, serialpassthrough or
 gpspassthrough (they save, reboot, wipe, change mode, spin a motor or hand the
-link to an ESC or GPS), and any argument holding a newline. The tool never
+link to an ESC or GPS), and any argument holding a character outside
+0x20-0x7e, a `?` or a `#`. The CLI's line editor ends a line at a newline or
+CR, exits on Ctrl-D at the start of a line, drops other bytes below 32, treats
+127 as backspace, completes on `?` and tab and cuts the line at `#`, so
+`sa\\x01ve`, `sa?` or `save#` would run as `save` behind a check on the typed
+word. `restore` applies the same rule to
+every line it would send and also refuses a first word that is not a command
+a `diff all` holds. Text from the FC is printed with control characters
+shown as \\xNN. `--selftest` checks all of this offline. The tool never
 saves unless --save is given and never flashes. Needs pyserial;
 `socket://host:port` works as a port (Betaflight SITL serves the CLI on TCP
 5761, UART1).
@@ -80,6 +88,13 @@ ERROR_MARK = '###ERROR'
 # serialpassthrough, gpspassthrough).
 FORBIDDEN = {'save', 'defaults', 'bl', 'dfu', 'exit', 'flash_erase', 'msc',
              'motor', 'escprog', 'serialpassthrough', 'gpspassthrough'}
+# First words `diff all` emits (Betaflight 2026.6.2 cli.c printConfig). A restore
+# file may send only these; anything else refuses the whole restore.
+ALLOWED = {'set', 'feature', 'serial', 'aux', 'adjrange', 'rxrange', 'rxfail',
+           'resource', 'timer', 'dma', 'beeper', 'beacon', 'map', 'mmix', 'smix',
+           'servo', 'vtx', 'vtxtable', 'led', 'color', 'mode_color', 'waypoint',
+           'profile', 'rateprofile', 'battery_profile', 'name', 'board_name',
+           'manufacturer_id', 'mcu_id', 'signature', 'batch', 'mixer'}
 # Lines of a diff restore does not send, with the reason (reported).
 SKIP_REASON = {
     'batch': 'batch start/end: restore does its own error tracking',
@@ -92,6 +107,51 @@ SKIP_REASON = {
 
 class Refused(Exception):
     pass
+
+
+def inert(s):
+    """s with every C0 control except newline, DEL and every C1 control shown as
+    \\xNN, so text from the FC cannot drive the terminal it is printed to."""
+    return ''.join(f'\\x{ord(c):02x}' if (ord(c) < 32 and c != '\n') or 0x7f <= ord(c) <= 0x9f
+                   else c for c in s)
+
+
+def sendable(line):
+    """True if every character is 0x20-0x7e and there is no `?` or `#`. The Betaflight
+    CLI editor ends a line at a newline or CR, exits on Ctrl-D at line start, drops
+    other bytes below 32, treats 127 as backspace, completes on `?` and tab and cuts
+    the line at `#`, so such a line runs as something other than what it spells."""
+    return all(' ' <= c <= '~' for c in line) and '?' not in line and '#' not in line
+
+
+def why_unsendable(line):
+    """Name the first character the CLI editor would act on, and what it does."""
+    for i, c in enumerate(line, 1):
+        if c == '?':
+            return f"a '?' at position {i}, which the CLI takes as command completion"
+        if c == '\t':
+            return f"a tab at position {i}, which the CLI takes as command completion"
+        if c == '\x7f':
+            return f"a DEL at position {i}, which the CLI takes as backspace"
+        if c == '#':
+            return f"a '#' at position {i}, which starts a comment: the CLI cuts the line there"
+        if c in '\n\r':
+            return f"a line break (\\x{ord(c):02x}) at position {i}, which ends the line here"
+        if c == '\x04':
+            return f"a control character (\\x04) at position {i}, which exits the CLI (a reboot) when it starts a line"
+        if c == '\x0c':
+            return f"a control character (\\x0c) at position {i}, which clears the screen"
+        if ord(c) < 32:
+            return f"a control character (\\x{ord(c):02x}) at position {i}, which is dropped"
+        if ord(c) > 126:
+            return f"a non-ASCII character at position {i}, which is dropped"
+    return None
+
+
+def refuse_unsendable(line, where):
+    if not sendable(line):
+        raise Refused(f"{where} has {why_unsendable(line)}, so it would run as something "
+                      f"other than what it spells: '{inert(line)}'")
 
 
 class NoLink(Exception):
@@ -247,7 +307,7 @@ def save_old(cli, port, a, ver):
     same port after the reboot. None if the save did not report success."""
     print("\n> save")
     ok, text = cli.save_and_reboot()
-    print(text.strip())
+    print(inert(text.strip()))
     if not ok:
         print("save did not report 'saving' and the link stayed up; nothing verified")
         return None
@@ -266,9 +326,9 @@ def adopt_firmware(cli, ident):
     cli.noreboot, known = noreboot_support(ident['version'])
     if not cli.noreboot:
         if known:
-            print(f"note: firmware {ident['version']} reboots on exit")
+            print(inert(f"note: firmware {ident['version']} reboots on exit"))
         else:
-            print(f"note: cannot read a version from {ident['version']!r}; treating the firmware "
+            print(f"note: cannot read a version from {inert(ident['version'])!r}; treating the firmware "
                   f"as older than 2025.12, so it reboots on exit")
 
 
@@ -335,12 +395,12 @@ def utc_stamp():
 
 def header(ident, port, what, warnings=()):
     return [f"# {TOOL} {what}",
-            f"# firmware: {ident['version']}",
-            f"# board: {ident['board']}",
-            f"# mcu: {ident['mcu']}",
-            f"# craft_name: {ident['craft'] or '-'}",
+            f"# firmware: {inert(ident['version'])}",
+            f"# board: {inert(ident['board'])}",
+            f"# mcu: {inert(ident['mcu'])}",
+            f"# craft_name: {inert(ident['craft']) or '-'}",
             f"# utc: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
-            f"# port: {port}"] + [f"# warning: firmware reported: {w}" for w in warnings]
+            f"# port: {port}"] + [f"# warning: firmware reported: {inert(w)}" for w in warnings]
 
 
 def safe(s):
@@ -364,7 +424,7 @@ def flag_errors(out):
     for ln in out.split('\n'):
         if ERROR_MARK in ln:
             errors.append(ln.strip().strip('#').strip())
-            ln = f"# bf-cli: firmware reported: {ln.strip()}"
+            ln = f"# bf-cli: firmware reported: {inert(ln.strip())}"
         lines.append(ln)
     return '\n'.join(lines), errors
 
@@ -413,13 +473,20 @@ def do_backup(cli, ident, port, outdir, dump):
 def print_warnings(warnings):
     print("WRITTEN WITH FIRMWARE WARNINGS:")
     for w in warnings:
-        print(f"  {w}")
+        print(f"  {inert(w)}")
+
+
+def file_lines(text):
+    """Lines of a file split on \\n alone, one trailing \\r dropped from each, so
+    \\x1c-\\x1e, \\x85 and U+2028 stay inside their line (splitlines() would cut
+    there) and fail `sendable`."""
+    return [ln[:-1] if ln.endswith('\r') else ln for ln in text.split('\n')]
 
 
 def read_file_header(path):
     """(header dict, embedded `# Betaflight / ...` dict or None, lines)."""
-    with open(path) as fh:
-        lines = fh.read().splitlines()
+    with open(path, encoding='utf-8', errors='replace', newline='') as fh:
+        lines = file_lines(fh.read())
     hdr = {}
     for ln in lines:
         m = re.match(r'# (firmware|board|mcu|craft_name): (.*)$', ln)
@@ -442,12 +509,14 @@ def first_word(line):
 
 
 def restore_lines(lines):
-    """(lines to send, {reason: count} skipped). Refuses a file with a dangerous line."""
+    """(lines to send, {reason: count} skipped). Refuses a file with a dangerous line,
+    a line that is not plain printable ASCII, or a first word `diff all` never emits."""
     send, skipped = [], {}
-    for ln in lines:
-        s = ln.strip()
+    for n, ln in enumerate(lines, 1):
+        s = ln.strip(' ')
         if not s or s.startswith('#'):
             continue
+        refuse_unsendable(s, f"line {n}")
         w = first_word(s)
         if w in SKIP_REASON:
             if w == 'defaults' and s.lower() != 'defaults nosave':
@@ -456,15 +525,31 @@ def restore_lines(lines):
                 raise Refused(f"file contains `{s}`")
             skipped[SKIP_REASON[w]] = skipped.get(SKIP_REASON[w], 0) + 1
         elif w in FORBIDDEN:
-            raise Refused(f"file contains a `{w}` line, which restore will not send: {s!r}")
+            raise Refused(f"file contains a `{w}` line, which restore will not send: '{s}'")
+        elif w not in ALLOWED:
+            raise Refused(f"line {n} starts with `{w}`, which is not a command a `diff all` "
+                          f"holds, so restore will not send it (restore takes a `diff all` "
+                          f"backup, not a `dump`): '{s}'")
         else:
             send.append(s)
     return send, skipped
 
 
 def normalized(text):
-    """Comparable config lines of a diff: what restore_lines would send."""
-    return restore_lines(text.split('\n'))
+    """Comparable config lines of the FC's own `diff all`. Nothing is sent, so
+    nothing is refused: comments and the lines restore skips are dropped, every
+    other line is kept verbatim, so an unexpected one shows up as a difference."""
+    out, skipped = [], {}
+    for ln in file_lines(text):
+        s = ln.strip(' ')
+        if not s or s.startswith('#'):
+            continue
+        w = first_word(s)
+        if w in SKIP_REASON and s.lower() == {'defaults': 'defaults nosave', 'save': 'save'}.get(w, s.lower()):
+            skipped[SKIP_REASON[w]] = skipped.get(SKIP_REASON[w], 0) + 1
+        else:
+            out.append(s)
+    return out, skipped
 
 
 def connect(a):
@@ -475,10 +560,10 @@ def connect(a):
 
 
 def show_ident(ident):
-    print(f"firmware: Betaflight {ident['version']} (git {ident['git']}, MSP API {ident['msp']})")
-    print(f"board:    {ident['board']} (id {ident['board_id']}, board_name {ident['board_name'] or '-'})")
-    print(f"mcu:      {ident['mcu']}")
-    print(f"craft:    {ident['craft'] or '-'}")
+    print(inert(f"firmware: Betaflight {ident['version']} (git {ident['git']}, MSP API {ident['msp']})"))
+    print(inert(f"board:    {ident['board']} (id {ident['board_id']}, board_name {ident['board_name'] or '-'})"))
+    print(inert(f"mcu:      {ident['mcu']}"))
+    print(inert(f"craft:    {ident['craft'] or '-'}"))
 
 
 def cmd_identify(a):
@@ -487,7 +572,7 @@ def cmd_identify(a):
         ident = identity(cli)
         adopt_firmware(cli, ident)
         show_ident(ident)
-        print("\nstatus:\n" + ident['status'])
+        print("\nstatus:\n" + inert(ident['status']))
         return 0
     finally:
         cli.leave(False)
@@ -510,15 +595,21 @@ def cmd_backup(a):
         cli.leave(False)
 
 
-def cmd_run(a):
-    for c in a.commands:
-        if '\n' in c or '\r' in c:
-            print(f"REFUSED: one CLI line per argument, got a newline in {c!r}")
-            return 1
+def check_run_args(commands):
+    """Refuse, before connecting, an argument that is not one plain printable line
+    or whose first word `run` never sends."""
+    for i, c in enumerate(commands, 1):
+        refuse_unsendable(c, f"argument {i}")
         if first_word(c) in FORBIDDEN:
-            print(f"REFUSED: `{first_word(c)}` is not sent by run (saving is --save only). "
-                  f"Nothing was sent.")
-            return 1
+            raise Refused(f"`{first_word(c)}` is not sent by run (saving is --save only)")
+
+
+def cmd_run(a):
+    try:
+        check_run_args(a.commands)
+    except Refused as e:
+        print(f"REFUSED: {e}. Nothing was sent.")
+        return 1
     cli, port = connect(a)
     errors, reboot, sets = [], True, []
     try:
@@ -530,7 +621,7 @@ def cmd_run(a):
             sm = SET_RE.match(c.strip())
             before = get_value(cli, sm.group(1)) if sm else None
             out = cli.cmd(c)
-            print(out)
+            print(inert(out))
             if ERROR_MARK in out:
                 errors.append(c)
                 break
@@ -538,9 +629,10 @@ def cmd_run(a):
                 name, target = sm.group(1), sm.group(2)
                 sets.append((name, target))
                 after = get_value(cli, name)
-                print(f"{name}: {before} -> {target} -> {after}")
+                print(inert(f"{name}: {before} -> {target} -> {after}"))
                 if after is None or not same_value(target, after):
-                    print(f"READBACK MISMATCH: sent {target!r}, the FC now holds {after!r}")
+                    print(f"READBACK MISMATCH: sent {target!r}, the FC now holds {inert(after or '')!r}" if after is not None
+                          else f"READBACK MISMATCH: sent {target!r}, the FC now holds None")
                     errors.append(c)
                     break
         if errors:
@@ -556,9 +648,9 @@ def cmd_run(a):
                 bad = []
                 for name, target in sets:
                     got = get_value(cli, name)
-                    print(f"after reboot: {name} = {got}")
+                    print(inert(f"after reboot: {name} = {got}"))
                     if got is None or not same_value(target, got):
-                        bad.append(f"{name}: wanted {target!r}, the FC holds {got!r}")
+                        bad.append(f"{name}: wanted {target!r}, the FC holds {inert(got or '')!r}")
                 if bad:
                     print("VERIFY MISMATCH after the save: " + '; '.join(bad))
                     return 1
@@ -566,7 +658,7 @@ def cmd_run(a):
                 return 0
             print("\n> save noreboot")
             out = cli.cmd('save noreboot')
-            print(out)
+            print(inert(out))
             if ERROR_MARK in out or 'saving' not in out:
                 print("save did not report 'saving'; ending with `exit`")
                 return 1
@@ -594,12 +686,12 @@ def cmd_restore(a):
         problems.append(f"file's own version line says {emb['board']} {emb['version']}, header says "
                         f"{hdr['board']} {hdr['firmware']}")
     if problems:
-        print("REFUSED: " + '; '.join(problems) + ". Nothing was connected to.")
+        print("REFUSED: " + '; '.join(problems) + ". Nothing was sent.")
         return 1
     try:
         send, skipped = restore_lines(flines)
     except Refused as e:
-        print(f"REFUSED: {e}. Nothing was connected to.")
+        print(f"REFUSED: {e}. Nothing was sent.")
         return 1
     if not send:
         print("REFUSED: the file holds no configuration lines")
@@ -627,14 +719,14 @@ def cmd_restore(a):
         print("\n> defaults nosave")
         out = cli.cmd('defaults nosave')
         if ERROR_MARK in out or 'resetting to defaults' not in out:
-            print(out)
+            print(inert(out))
             print("defaults nosave did not report success; nothing applied; ending with `exit`")
             return 1
         failing = []
         for ln in send:
             out = cli.cmd(ln)
             if ERROR_MARK in out:
-                failing.append((ln, out.strip()))
+                failing.append((ln, inert(out.strip())))
         print(f"sent {len(send)} lines from {a.file}, {len(failing)} with errors")
         for key, n in skipped.items():
             print(f"not sent ({n}x): {key}")
@@ -656,7 +748,7 @@ def cmd_restore(a):
         else:
             out = cli.cmd('save noreboot')
             if ERROR_MARK in out or 'saving' not in out:
-                print(out)
+                print(inert(out))
                 print("save did not report 'saving'; ending with `exit`")
                 return 1
             reboot = False
@@ -667,13 +759,226 @@ def cmd_restore(a):
             return 0
         print("MISMATCH between the FC's `diff all` and the file (- file, + FC):")
         for d in difflib.unified_diff(send, after, 'file', 'FC', n=0, lineterm=''):
-            print(d)
+            print(inert(d))
         return 1
     finally:
         cli.leave(reboot)
 
 
+DIFF_BODY = """# Betaflight / STM32H743 (S743) 2026.6.2 Jun  1 2026 / 10:00:00 (abcdef0) MSP API: 1.47
+# config: manufacturer_id: TEST, board_name: TESTH743, version: 1a2b3c4d, date: 2026-06-01T10:00:00Z
+
+# start the command batch
+batch start
+
+board_name TESTH743
+manufacturer_id TEST
+mcu_id 001a002b003c004d005e006f
+signature
+
+# name: MYQUAD
+
+# resources
+resource MOTOR 1 B00
+timer B00 AF2
+dma pin B00 0
+dma ADC 1 1
+
+# feature
+feature -AIRMODE
+feature GPS
+beeper -ON_USB
+beacon RX_LOST
+serial 0 64 115200 57600 0 115200
+serial 1 8192 115200 57600 0 115200
+map TAER
+mmix 0 1.000 1.000 -1.000 1.000
+smix 0 1 0 100 0 0 100 0
+servo 0 1000 2000 1500 100 -1
+vtx 0 0 0 0 1 1000 1200
+vtxtable bands 5
+led 0 0,0::C:0
+color 0 0,0,0
+mode_color 0 0 0
+waypoint 0 1 0 0 0
+aux 0 0 0 1700 2100 0 0
+adjrange 0 0 0 900 2100 0 0 0 0
+rxrange 0 1000 2000
+rxfail 0 a
+
+# name
+name MYQUAD
+
+# profile 0
+profile 0
+set p_pitch = 52
+set d_roll = 40
+
+# rateprofile 0
+rateprofile 0
+set roll_rc_rate = 120
+
+# battery_profile 0
+battery_profile 0
+set vbat_max_cell_voltage = 430
+
+# restore original profile selection
+profile 0
+rateprofile 0
+battery_profile 0
+
+set craft_name = MYQUAD
+set gyro_lpf1_static_hz = 0
+set vbat_warning_cell_voltage = 340
+
+batch end
+
+defaults nosave
+
+save
+"""
+
+# (name, python text for a restore file's line). Each must be refused by restore_lines.
+REFUSE_LINES = [
+    ('sa\\x01ve (C0 inside save)', 'sa\x01ve'),
+    ('savex\\x7f (DEL as backspace)', 'savex\x7f'),
+    ('sa? (completion)', 'sa?'),
+    ('sa<TAB> (completion)', 'sa\t'),
+    ('sa\\x1fve', 'sa\x1fve'),
+    ('b\\x01l (bootloader)', 'b\x01l'),
+    ('lone \\x04', '\x04'),
+    ('sa\\x1cve (splitlines separator)', 'sa\x1cve'),
+    ('sa\\x85ve (C1 NEL)', 'sa\x85ve'),
+    ('sa\\u2028ve (line separator)', 'sa ve'),
+    ('set x = caf\\xe9 (non-ASCII)', 'set x = caf\xe9'),
+    ('dshotprog 1 2 (not in diff all)', 'dshotprog 1 2'),
+    ('flash_write 0 x (not in diff all)', 'flash_write 0 x'),
+    ('bl (FORBIDDEN)', 'bl'),
+    ('motor 1 1000 (FORBIDDEN)', 'motor 1 1000'),
+]
+
+
+def selftest():
+    """Offline checks of the line gate, restore_lines, first_word and inert."""
+    results = []
+
+    def check(name, ok):
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}: {name}")
+
+    def refused(fn, *args):
+        try:
+            fn(*args)
+        except Refused:
+            return True
+        return False
+
+    # restore: each of these in an otherwise good file refuses the whole restore
+    good = DIFF_BODY.split('\n')
+    for name, bad in REFUSE_LINES:
+        text = DIFF_BODY.replace('\nset craft_name = MYQUAD\n', '\n' + bad + '\nset craft_name = MYQUAD\n')
+        check(f"restore refuses {name}", refused(restore_lines, file_lines(text)))
+        check(f"restore refuses {name} (alone)", refused(restore_lines, file_lines('set a = 1\n' + bad + '\n')))
+    # a file read through read_file_header splits on \n only
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'x.diff')
+        with open(p, 'w', encoding='utf-8', newline='') as fh:
+            fh.write('# firmware: 2026.6.2\n# board: X\nset a = 1\nsa\x1cve\n')
+        lines = read_file_header(p)[2]
+        check("read_file_header keeps \\x1c inside its line", 'sa\x1cve' in lines)
+        check("read_file_header file with \\x1c refuses at restore_lines", refused(restore_lines, lines))
+    check("file_lines drops one trailing \\r", file_lines('set a = 1\r\nset b = 2\r\r\n') == ['set a = 1', 'set b = 2\r', ''])
+
+    # restore: a realistic diff all body is accepted
+    try:
+        send, skipped = restore_lines(good)
+        check("restore accepts a 2026.6.2 diff all body", True)
+    except Refused as e:
+        send, skipped = [], {}
+        print(f"  refused: {e}")
+        check("restore accepts a 2026.6.2 diff all body", False)
+    check("accepted body: set/profile/serial lines are sent",
+          'set craft_name = MYQUAD' in send and 'serial 0 64 115200 57600 0 115200' in send
+          and 'profile 0' in send and 'resource MOTOR 1 B00' in send)
+    check("accepted body: batch, defaults, save, mcu_id, signature are not sent",
+          not any(first_word(s) in SKIP_REASON for s in send) and len(skipped) == 5)
+    check("accepted body: every sent word is on the allowlist",
+          all(first_word(s) in ALLOWED for s in send))
+    check("a non-QUADX diff with a mixer line is accepted and sent",
+          'mixer HEX6X' in restore_lines(file_lines('mixer HEX6X\nset a = 1\n'))[0])
+    check("refusal names the character and what the CLI does with it",
+          "a '?' at position 3" in why_unsendable('sa?') and 'backspace' in why_unsendable('save\x7f')
+          and '\\x01' in why_unsendable('sa\x01ve') and 'completion' in why_unsendable('sa\t'))
+    check("why_unsendable names newline, comment and EOT",
+          'ends the line' in why_unsendable('a\nb') and 'comment' in why_unsendable('a#b')
+          and 'exits' in why_unsendable('a\x04b') and 'clears' in why_unsendable('a\x0cb'))
+    check("restore refuses a mid-line # and `save#`",
+          refused(restore_lines, ['set a = 1 # save']) and refused(restore_lines, ['save#']))
+    check("restore still skips a comment line", restore_lines(['  # comment', 'set a = 1']) == (['set a = 1'], {}))
+    check("sendable refuses #", not sendable('save#'))
+    check("no private board name in the file", ('LUX' + 'N') not in open(__file__, encoding='utf-8').read())
+    check("normalized keeps a word outside ALLOWED without raising",
+          'dshotprog 1 2' in normalized('set a = 1\ndshotprog 1 2\nsa\x01ve\n')[0])
+    check("normalized matches restore_lines on a good diff body", normalized(DIFF_BODY) == (send, skipped))
+    check("accepted body: CRLF file gives the same lines",
+          restore_lines(file_lines(DIFF_BODY.replace('\n', '\r\n'))) == (send, skipped))
+    check("every ALLOWED word is accepted as a line",
+          not any(refused(restore_lines, [w + ' 1']) for w in ALLOWED - set(SKIP_REASON)))
+    check("restore still refuses `defaults` other than nosave", refused(restore_lines, ['defaults']))
+    check("restore still refuses `save noreboot`", refused(restore_lines, ['save noreboot']))
+    check("restore accepts uppercase first word", restore_lines(['SET a = 1'])[0] == ['SET a = 1'])
+
+    # sendable
+    check("sendable accepts a plain line", sendable('set craft_name = MY-QUAD_1'))
+    check("sendable accepts the empty line", sendable(''))
+    for name, ch in [('tab', '\t'), ('newline', '\n'), ('CR', '\r'), ('DEL', '\x7f'),
+                     ('ESC', '\x1b'), ('NUL', '\x00'), ('C1', '\x9b'), ('?', '?'), ('e-acute', '\xe9')]:
+        check(f"sendable refuses {name}", not sendable('a' + ch + 'b'))
+
+    # run arguments
+    for name, arg in [('sa\\x01ve', 'sa\x01ve'), ('b\\x01l', 'b\x01l'), ('sa?', 'sa?'),
+                      ('save#', 'save#'), ('bl#x', 'bl#x'), ('defaults#', 'defaults#'), ('exit#', 'exit#'),
+                      ('savex\\x7f', 'savex\x7f'), ('save<TAB>', 'save\t'),
+                      ('two lines', 'get a\nsave'), ('CR', 'get a\rsave'),
+                      ('save', 'save'), ('  Bl', '  Bl'), ('motor 1 2000', 'motor 1 2000'),
+                      ('non-ASCII', 'set craft_name = \xe9')]:
+        check(f"run refuses {name}", refused(check_run_args, ['get craft_name', arg]))
+    check("run accepts plain commands",
+          not refused(check_run_args, ['get craft_name', 'set craft_name = QUAD', 'status', 'diff all']))
+    check("run refusal names the line through inert",
+          'sa\\x01ve' in str(_msg(check_run_args, ['sa\x01ve'])))
+
+    # first_word and inert
+    check("first_word lowercases and takes the first word", first_word('  SET a = 1') == 'set')
+    check("first_word of an empty line is empty", first_word('   ') == '')
+    check("inert escapes ESC", inert('a\x1b[2Jb') == 'a\\x1b[2Jb')
+    check("inert escapes BEL", inert('\x07') == '\\x07')
+    check("inert escapes C1 0x9b", inert('\x9b') == '\\x9b')
+    check("inert escapes DEL and NUL", inert('\x7f\x00') == '\\x7f\\x00')
+    check("inert keeps newline and printable text", inert('a b\nc~') == 'a b\nc~')
+    check("inert keeps non-ASCII above C1", inert('caf\xe9') == 'caf\xe9')
+    check("inert escapes CR", inert('a\rb') == 'a\\x0db')
+    check("header writes craft, mcu, board, version through inert",
+          '\x1b' not in ''.join(header({'version': '1\x1b', 'board': 'B\x07', 'mcu': 'M\x9b',
+                                        'craft': 'C\x1b[2J'}, 'p', 'diff all')))
+
+    failed = results.count(False)
+    print(f"{results.count(True)} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+def _msg(fn, *args):
+    try:
+        fn(*args)
+    except Refused as e:
+        return e
+    return ''
+
+
 def main():
+    if '--selftest' in sys.argv[1:]:
+        return selftest()
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port', help='serial device or socket://host:port (default: the first '
@@ -681,6 +986,7 @@ def main():
     ap.add_argument('--baud', type=int, default=115200)
     ap.add_argument('--timeout', type=float, default=30.0,
                     help='seconds to wait for the prompt after one line (diff/dump get at least 120)')
+    ap.add_argument('--selftest', action='store_true', help='offline checks of the line gate and exit')
     sub = ap.add_subparsers(dest='cmd', required=True)
     sub.add_parser('identify', help='read-only')
     b = sub.add_parser('backup', help='read-only')

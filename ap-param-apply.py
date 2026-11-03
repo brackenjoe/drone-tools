@@ -18,10 +18,16 @@ system id (MAV_SYSID from Copter 4.7, SYSID_THISMAV before).
   plan       read-only: every name in the files read back, with what it
              would change to. A name the firmware does not have refuses the
              run: a renamed parameter written by name is silently nothing
-  write      plan, then PARAM_SET each changed name and read it back. Prints
-             every change (before, after, status) and logs every line, the
-             unchanged ones too (those are logged, not printed); exits 1 on
-             any readback that does not match
+  write      plan, then PARAM_SET each changed name and read it back. Needs a
+             fresh heartbeat showing the FC disarmed before the first write
+             (REFUSED otherwise, nothing written). Before each later write it
+             checks the heartbeats seen since the last one; if the FC armed,
+             it stops with STOPPED, exit 1, and says how many writes were
+             made. After the last write it checks once more: armed, or no
+             heartbeat to tell, is a WARNING and exit 1. A write already sent
+             cannot be undone. Prints every change (before, after, status)
+             and logs every line, the unchanged ones too (those are logged,
+             not printed); exits 1 on any readback that does not match
   reboot     MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, refused while armed
 
 Files are Mission Planner "NAME,value" (MAVProxy "NAME value" also parses),
@@ -174,16 +180,35 @@ class FC:
         self.hb = hb
         self.sysid, self.compid = hb.get_srcSystem(), hb.get_srcComponent()
         self.m.target_system, self.m.target_component = self.sysid, self.compid
+        self.armed_seen = False
 
-    def armed(self):
+    def armed_queued(self):
+        """True if the armed bit was seen on the pinned autopilot's heartbeats
+        queued since the last call, or noted while waiting in set(). Does not block."""
+        seen, self.armed_seen = self.armed_seen, False
+        while True:
+            msg = self.m.recv_match(type='HEARTBEAT', blocking=False)
+            if msg is None:
+                return seen
+            if msg.get_srcSystem() == self.sysid and msg.get_srcComponent() == self.compid:
+                seen = seen or bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+    def armed(self, refuse_if_silent=True):
+        """Armed state from a fresh heartbeat. With no heartbeat in 3 s it exits
+        REFUSED, or returns None when refuse_if_silent is False (used after writes,
+        where REFUSED would read as "nothing was done")."""
+        # a heartbeat queued while a slow step ran may be stale: read those first
+        queued = self.armed_queued()
         end, hb = time.time() + 3, None
         while time.time() < end and hb is None:
             msg = self.m.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
             if msg and msg.get_srcSystem() == self.sysid and msg.get_srcComponent() == self.compid:
                 hb = msg
         if hb is None:
+            if not refuse_if_silent:
+                return True if queued else None
             sys.exit("REFUSED: no fresh heartbeat from the FC, so its armed state is unknown")
-        return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        return queued or bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
     def versions(self):
         """One dict per distinct board answering as the pinned (sysid, compid)."""
@@ -192,7 +217,8 @@ class FC:
             fv = v.flight_sw_version
             out.append({
                 'version': f"{(fv >> 24) & 0xff}.{(fv >> 16) & 0xff}.{(fv >> 8) & 0xff}",
-                'git': bytes(v.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip(),
+                'git': re.sub(r'[^0-9A-Za-z]', '?',
+                              bytes(v.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip()),
                 'board': v.board_version >> 16,
                 'board_version': v.board_version,
                 'uid': bytes(v.uid2[:12]).hex().upper(),
@@ -217,8 +243,12 @@ class FC:
             self.m.mav.param_set_send(self.sysid, self.compid, name.encode(), float(value), ptype)
             end = time.time() + timeout
             while time.time() < end:
-                msg = recv_from(self.m, 'PARAM_VALUE', self.sysid, self.compid, 0.3)
-                if msg and msg.param_id == name:
+                msg = recv_from(self.m, ['PARAM_VALUE', 'HEARTBEAT'], self.sysid, self.compid, 0.3)
+                if msg is not None and msg.get_type() == 'HEARTBEAT':
+                    # the wait would otherwise discard it, and with it an arm
+                    if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+                        self.armed_seen = True
+                elif msg and msg.param_id == name:
                     return float(msg.param_value)
         return None
 
@@ -324,17 +354,25 @@ def main():
     if a.cmd == 'plan':
         return 0
 
-    if armed:
+    # plan can take seconds per name: the state read before it is stale
+    if fc.armed():
         sys.exit("REFUSED: the vehicle is armed")
     log = open(a.log, 'a') if a.log else None
     stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    fails = []
+    fails, wrote = [], 0
     print(f"\n{'name':{w}}  {'before':>12}  {'after':>12}")
     for name, before, ptype, target, src in planned:
         if f32(before) == f32(target):
             after, status = before, 'unchanged'
         else:
+            if fc.armed_queued():
+                if log:
+                    log.close()
+                print(f"wrote {wrote} of {len(changes)}; next was {name}")
+                sys.exit(f"STOPPED: the FC armed during the write after {wrote} of "
+                         f"{len(changes)} writes; next was {name}. The writes made cannot be undone.")
             after = fc.set(name, target, ptype)
+            wrote += 1
             status = 'ok' if after is not None and f32(after) == f32(target) else 'FAILED'
             if status == 'FAILED':
                 fails.append(name)
@@ -343,6 +381,19 @@ def main():
             log.write(f"{stamp}\t{v['uid']}\t{name}\t{fmt(before)}\t{fmt(target)}\t{fmt(after)}\t{status}\t{src}\n")
     if log:
         log.close()
+    # Heartbeats come about once a second, so on a fast link an arm in the last
+    # second of the loop can go unseen until now. A write cannot be undone; the
+    # run must not report success.
+    if wrote:
+        now = fc.armed(refuse_if_silent=False)
+        if now:
+            print(f"\nWARNING: the FC is armed now, after {wrote} write(s): the last writes "
+                  "may have landed while it was armed. Check the vehicle before flying.")
+            return 1
+        if now is None:
+            print(f"\nWARNING: {wrote} write(s) were made, then no heartbeat arrived, so "
+                  "whether the FC armed during them is unknown. Check the vehicle before flying.")
+            return 1
     if fails:
         print(f"\nFAILED readback: {', '.join(fails)}")
         return 1

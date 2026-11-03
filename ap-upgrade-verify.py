@@ -46,7 +46,7 @@ of a dump, so there is nothing to compare.
 
 Offline. Reads files, talks to nothing.
 """
-import argparse, json, struct, sys
+import argparse, json, math, re, struct, sys
 
 ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
 ap.add_argument('pre', help='parameter dump from before the upgrade')
@@ -80,8 +80,22 @@ VOLATILE = ('STAT_BOOTCNT', 'STAT_RUNTIME', 'STAT_FLTTIME', 'STAT_RESET',
             'COMPASS_DEC')
 
 
+_CTRL = re.compile('[\x00-\x1f\x7f-\x9f]')
+
+
+def inert(s):
+    """Make a string safe to print: C0, DEL and C1 characters become \\xNN.
+    A parameter name comes from a file or a JSON map and can carry an escape
+    sequence that a terminal would act on. Applied where text is printed, not
+    where it is parsed, so the comparisons still see the real bytes."""
+    return _CTRL.sub(lambda m: '\\x%02x' % ord(m.group()), str(s))
+
+
 def load(path):
-    d = {}
+    """Return ({name: value}, number of lines whose value did not parse).
+    nan and inf are not parameter values a board stores; they count as
+    unparseable rather than as a number that compares oddly."""
+    d, bad = {}, 0
     for line in open(path):
         line = line.strip()
         if not line or line.startswith('#'):
@@ -93,22 +107,34 @@ def load(path):
         else:
             continue
         try:
-            d[name.strip()] = float(val.strip())
+            v = float(val.strip())
         except ValueError:
+            bad += 1
             continue
-    return d
+        if not math.isfinite(v):
+            bad += 1
+            continue
+        d[name.strip()] = v
+    return d, bad
 
 
 def f32(x):
     """Compare as the board stores them. A gain that survived a float32 round
     trip is not a mismatch just because Python kept more digits."""
-    return struct.unpack('f', struct.pack('f', x))[0]
+    try:
+        return struct.unpack('f', struct.pack('f', x))[0]
+    except OverflowError:
+        return x
 
 
 def close(x, y):
     x, y = f32(x), f32(y)
+    if math.isnan(x) or math.isnan(y):
+        return False
     if x == y:
         return True
+    if math.isinf(x) or math.isinf(y):
+        return False
     scale = max(abs(x), abs(y))
     if scale == 0:
         return False
@@ -116,16 +142,23 @@ def close(x, y):
 
 
 def main():
-    pre, post = load(a.pre), load(a.post)
-    pre_def = load(a.pre_defaults) if a.pre_defaults else {}
-    post_def = load(a.post_defaults) if a.post_defaults else {}
+    (pre, pre_bad), (post, post_bad) = load(a.pre), load(a.post)
+    pre_def, pre_def_bad = load(a.pre_defaults) if a.pre_defaults else ({}, 0)
+    post_def, post_def_bad = (load(a.post_defaults) if a.post_defaults
+                              else ({}, 0))
     table = json.load(open(a.renames))['renames']
 
-    print(f"pre  {a.pre}: {len(pre)} params"
+    print(f"pre  {inert(a.pre)}: {len(pre)} params"
           f"{f', {len(pre_def)} defaults' if pre_def else ''}")
-    print(f"post {a.post}: {len(post)} params"
+    print(f"post {inert(a.post)}: {len(post)} params"
           f"{f', {len(post_def)} defaults' if post_def else ''}")
-    print(f"renames: {len(table)}\n")
+    print(f"renames: {len(table)}")
+    for path, n in ((a.pre, pre_bad), (a.post, post_bad),
+                    (a.pre_defaults, pre_def_bad),
+                    (a.post_defaults, post_def_bad)):
+        if n:
+            print(f"unparseable lines in {inert(path)}: {n}")
+    print()
 
     renamed_old = {r['old'] for r in table}
     renamed_new = {r['new'] for r in table}
@@ -147,7 +180,8 @@ def main():
         if close(want, got):
             ok += 1
             if not a.quiet_ok:
-                print(f"  OK             {old:20s} -> {new:20s} "
+                print(f"  OK             {inert(old):20s} -> "
+                      f"{inert(new):20s} "
                       f"{pre[old]:g} x {factor:g} = {got:g}")
             continue
 
@@ -166,19 +200,19 @@ def main():
     if moved:
         print(f"\n  --- DEFAULT-MOVED, param was never stored ({len(moved)}) ---")
         for old, new, factor, pv, want, got, nd in moved:
-            print(f"  {old} -> {new}")
+            print(f"  {inert(old)} -> {inert(new)}")
             print(f"      was {pv:g} (the old default), expected {want:g}, "
                   f"board holds {got:g} (the new default {nd:g})")
 
     if absent:
         print(f"\n  --- NOT COMPARABLE ({len(absent)}) ---")
         for old, new, why in absent:
-            print(f"  {old} -> {new}: {why}")
+            print(f"  {inert(old)} -> {inert(new)}: {why}")
 
     if mismatches:
         print(f"\n  *** MISMATCH ({len(mismatches)}) ***")
         for old, new, factor, pv, want, got, od, nd in mismatches:
-            print(f"  {old} -> {new}  factor {factor:g}")
+            print(f"  {inert(old)} -> {inert(new)}  factor {factor:g}")
             print(f"      pre {pv!r}  expected {want!r}  ACTUAL {got!r}")
             print(f"      (old default {od!r}, new default {nd!r})")
     else:
@@ -206,18 +240,18 @@ def main():
         print(f"\n  --- rewritten by the firmware, expected to differ "
               f"({len(volatile)}) ---")
         for n in volatile:
-            print(f"  {n}: {pre[n]:g} -> {post[n]:g}")
+            print(f"  {inert(n)}: {pre[n]:g} -> {post[n]:g}")
     if defmoved:
         print(f"\n  --- default moved, param unstored ({len(defmoved)}) ---")
         for n in defmoved:
-            print(f"  {n}: {pre[n]:g} -> {post[n]:g}  (default "
+            print(f"  {inert(n)}: {pre[n]:g} -> {post[n]:g}  (default "
                   f"{pre_def[n]:g} -> {post_def[n]:g})")
     if unexplained:
         print(f"\n  *** UNEXPLAINED ({len(unexplained)}) ***")
         for n in unexplained:
             od = pre_def.get(n)
             nd = post_def.get(n)
-            print(f"  {n}: {pre[n]!r} -> {post[n]!r}  "
+            print(f"  {inert(n)}: {pre[n]!r} -> {post[n]!r}  "
                   f"(defaults {od!r} -> {nd!r})")
     else:
         print("\n  nothing unexplained.")
@@ -234,7 +268,7 @@ def main():
     if gone_nondefault:
         print("\n  --- gone AND had a non-default value ---")
         for n in gone_nondefault:
-            print(f"  {n} = {pre[n]!r}  (old default {pre_def.get(n)!r})")
+            print(f"  {inert(n)} = {pre[n]!r}  (old default {pre_def.get(n)!r})")
 
     return 1 if (mismatches or unexplained) else 0
 
