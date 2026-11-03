@@ -41,9 +41,16 @@ fixed in 2.4.50) and ap-ftp-get.py beside this script.
 *-if00 interface preferred), else /dev/ttyACM0 if it exists, else it exits
 asking for --device.
 
-Exit status: 0 complete; 1 a failed or inconsistent transfer, or a
-PARAM_REQUEST_LIST fallback that got fewer values than the vehicle reported
-(the file is still written, with a loud line); 2 bad arguments.
+It talks to the first autopilot heartbeat it hears (not a ground station,
+nor anything marked as a non-autopilot) and takes replies only from that
+system and component. Before reading, it listens 3 s for AUTOPILOT_VERSION
+and refuses if more than one uid answers at that system id, since two boards
+behind one router would both answer and their parameters would mix.
+
+Exit status: 0 complete; 1 any error, including pymavlink not found, no autopilot heartbeat, two boards answering at
+one system id, a failed or inconsistent transfer, or a PARAM_REQUEST_LIST
+fallback that got fewer values than the vehicle reported (the file is still
+written, with a loud line); 2 bad arguments.
 
 Read-only against the vehicle: it requests, it never sets or saves.
 """
@@ -68,6 +75,69 @@ try:
     from pymavlink import mavutil, mavftp
 except ImportError:
     sys.exit("pymavlink not found: pip install 'pymavlink>=2.4.50'")
+
+
+def pin_autopilot(m, secs):
+    """The autopilot's heartbeat, not whichever arrives first: through a
+    router or on a shared link the first one may be a GCS's. None on timeout."""
+    end = time.time() + secs
+    while time.time() < end:
+        msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
+        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+            m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
+            return msg
+    return None
+
+
+def recv_from(m, types, sysid, compid, timeout, condition=None):
+    """recv_match that takes a message only from the pinned autopilot
+    (sysid, compid). A message from anyone else is skipped and the wait goes
+    on to its own deadline, so a foreign message neither ends the wait early
+    nor is taken as the answer. None on timeout."""
+    end = time.time() + timeout
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return None
+        msg = m.recv_match(type=types, blocking=True, timeout=left, condition=condition)
+        if msg is None:
+            return None
+        if msg.get_srcSystem() == sysid and msg.get_srcComponent() == compid:
+            return msg
+
+
+def autopilot_versions(m, sysid, compid, window=3.0, tries=3):
+    """Every distinct board that answers a version request as (sysid, compid).
+    One REQUEST_MESSAGE(AUTOPILOT_VERSION) is sent; replies from that same
+    (sysid, compid) are collected for `window` seconds, de-duplicated by uid2.
+    Two replies with one uid2 are one board heard on two paths; two uids are
+    two boards sharing a system id. Re-sent up to `tries` times if nothing
+    arrives. Returns [] if no board answers."""
+    for _ in range(tries):
+        m.mav.command_long_send(sysid, compid, mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+                                mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+                                0, 0, 0, 0, 0, 0)
+        end, found = time.time() + window, {}
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                break
+            v = recv_from(m, 'AUTOPILOT_VERSION', sysid, compid, left)
+            if v is None:
+                break
+            found.setdefault(bytes(v.uid2[:12]).hex().upper(), v)
+        if found:
+            return list(found.values())
+    return []
+
+
+def refuse_shared_sysid(uids, sysid, compid):
+    """Exit with the refusal when more than one board answers as (sysid, compid)."""
+    if len(uids) > 1:
+        sys.exit(f"REFUSED: {len(uids)} flight controllers answer as system {sysid} "
+                 f"component {compid} on this link (uids {', '.join(uids)}). "
+                 f"Give each its own system id (MAV_SYSID on 4.7, SYSID_THISMAV before 4.7).")
 
 
 def find_device():
@@ -149,7 +219,7 @@ def fetch_request_list(m):
     m.mav.param_request_list_send(m.target_system, m.target_component)
     values, expected, last = {}, None, time.time()
     while time.time() - last < 12:
-        msg = m.recv_match(type='PARAM_VALUE', blocking=True, timeout=3)
+        msg = recv_from(m, 'PARAM_VALUE', m.target_system, m.target_component, 3)
         if msg is None:
             continue
         last = time.time()
@@ -200,10 +270,10 @@ def snapshot_health(m, path, secs):
     seen, texts = {}, []
     deadline = time.time() + secs
     while time.time() < deadline:
-        msg = m.recv_match(blocking=True, timeout=2,
-                           type=['SYS_STATUS', 'GPS_RAW_INT', 'RC_CHANNELS',
-                                 'STATUSTEXT', 'SCALED_IMU2', 'SCALED_IMU3',
-                                 'RAW_IMU', 'AUTOPILOT_VERSION'])
+        msg = recv_from(m, ['SYS_STATUS', 'GPS_RAW_INT', 'RC_CHANNELS',
+                            'STATUSTEXT', 'SCALED_IMU2', 'SCALED_IMU3',
+                            'RAW_IMU', 'AUTOPILOT_VERSION'],
+                        m.target_system, m.target_component, 2)
         if msg is None:
             continue
         t = msg.get_type()
@@ -268,9 +338,12 @@ def main():
     print(f"connecting to {device} ...")
     m = mavutil.mavlink_connection(device, baud=a.baud, source_system=250,
                                    source_component=190)
-    if m.wait_heartbeat(timeout=30) is None:
-        sys.exit(f"no heartbeat on {device}")
-    print(f"  heartbeat: system {m.target_system}")
+    if pin_autopilot(m, 30) is None:
+        sys.exit(f"no autopilot heartbeat on {device}")
+    print(f"  heartbeat: autopilot system {m.target_system} component {m.target_component}")
+    boards = autopilot_versions(m, m.target_system, m.target_component)
+    refuse_shared_sysid([bytes(v.uid2[:12]).hex().upper() for v in boards],
+                        m.target_system, m.target_component)
 
     values = defaults = None
     incomplete = False

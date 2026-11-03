@@ -63,7 +63,10 @@ transfer as `ap-ftp-get.py`, so keep the two files side by side. It resets
 the board's MAVFTP sessions first, so a transfer another ground station has
 open on the same vehicle will fail. Without MAVFTP it falls back to
 `PARAM_REQUEST_LIST`, says so, and writes no defaults; if that read comes
-back short, it still writes the file and exits 1. `--health FILE` adds
+back short, it still writes the file and exits 1. It picks its board the
+same way as `ap-param-apply.py` (below), and refuses before reading anything
+if two boards answer at one system id, since it would mix their
+parameters. `--health FILE` adds
 a snapshot of sensors, GPS, RC and the PreArm checks.
 
 `ap-upgrade-verify.py` exits 1 on any MISMATCH (a value not carried
@@ -95,6 +98,30 @@ change. `write` prints every change and logs every line with `--log`.
 `--expect-git` is compared as an 8-character prefix of the firmware hash.
 A `never-write.txt` beside a parameter file lists names or patterns that
 no file may set.
+
+**Which board it talks to.** It uses the first heartbeat it hears that is
+not from a ground station and not marked as a non-autopilot (as gimbals,
+cameras and companion computers should mark themselves), and it takes
+replies only from that system and component id. That is not a choice of
+board: with several autopilots on one link, which one a run reaches depends
+on timing. Behind a router, always pass `--expect-uid` (the board's unique id,
+`AUTOPILOT_VERSION.uid2`: the MCU id on STM32 boards; `identify` prints it), so that a wrong pick is
+refused, and run again. `identify`, and `plan` without pins, simply report
+the board they reached.
+
+**Two boards with one system id.** The uid pin checks the identity in the
+first reply, but a write is addressed by system id. Behind a router, two
+boards at the same id both take it (measured with mavlink-router v4 and
+ArduCopter 4.7.1 SITL). So every subcommand asks for identity, listens for
+3 s, and refuses if more than one uid answers. The refusal catches two
+boards that both answer within those 3 s at the start of the run. It does
+not catch a board that answers late or joins afterwards, or two boards
+reporting the same uid. That last case covers Linux-based boards cloned
+from one image, and boards that report a uid of all zeros. Nor does it
+stop a hostile node: without MAVLink signing, which this tool does not use,
+any sender can claim a board's ids. It guards against mistakes. Give each
+flight controller its own system id (`MAV_SYSID` from Copter 4.7,
+`SYSID_THISMAV` before).
 
 ## ap-ftp-get.py
 

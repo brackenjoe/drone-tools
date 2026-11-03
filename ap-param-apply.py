@@ -4,11 +4,15 @@
 """Write ArduPilot parameter files to ONE pinned flight controller, and prove it.
 
 Every write here is pinned to a board by three things read off the vehicle
-before anything is sent: the MCU's unique id (AUTOPILOT_VERSION.uid2, the same
-24 hex digits as the USB serial in /dev/serial/by-id), the firmware's git hash
-and the board id. A mismatch on any of them refuses the whole run, so a file
-meant for one FC cannot land on another that happens to be on the same USB
-port or router.
+before anything is sent: the board's unique id (AUTOPILOT_VERSION.uid2; on STM32 boards the MCU id,
+the same 24 hex digits as the USB serial in /dev/serial/by-id), the firmware's git hash
+and the board id. A mismatch on any of them refuses the whole run. A write is
+addressed by system id, though, and two FCs at one system id behind a router
+both take it (measured in SITL), so every subcommand also listens 3 s for
+AUTOPILOT_VERSION and refuses if more than one uid answers. That catches two
+boards that both answer then; not a board that answers late or joins afterwards, two boards with the
+same uid, or a hostile node (no MAVLink signing here). Give each FC its own
+system id (MAV_SYSID from Copter 4.7, SYSID_THISMAV before).
 
   identify   read-only: version, git hash, board id, uid, armed state
   plan       read-only: every name in the files read back, with what it
@@ -102,6 +106,56 @@ def read_files(paths):
     return [(nm, vals[nm][0], vals[nm][1]) for nm in order]
 
 
+def recv_from(m, types, sysid, compid, timeout, condition=None):
+    """recv_match that takes a message only from the pinned autopilot
+    (sysid, compid). A message from anyone else is skipped and the wait goes
+    on to its own deadline, so a foreign message neither ends the wait early
+    nor is taken as the answer. None on timeout."""
+    end = time.time() + timeout
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return None
+        msg = m.recv_match(type=types, blocking=True, timeout=left, condition=condition)
+        if msg is None:
+            return None
+        if msg.get_srcSystem() == sysid and msg.get_srcComponent() == compid:
+            return msg
+
+
+def autopilot_versions(m, sysid, compid, window=3.0, tries=3):
+    """Every distinct board that answers a version request as (sysid, compid).
+    One REQUEST_MESSAGE(AUTOPILOT_VERSION) is sent; replies from that same
+    (sysid, compid) are collected for `window` seconds, de-duplicated by uid2.
+    Two replies with one uid2 are one board heard on two paths; two uids are
+    two boards sharing a system id. Re-sent up to `tries` times if nothing
+    arrives. Returns [] if no board answers."""
+    for _ in range(tries):
+        m.mav.command_long_send(sysid, compid, mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+                                mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+                                0, 0, 0, 0, 0, 0)
+        end, found = time.time() + window, {}
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                break
+            v = recv_from(m, 'AUTOPILOT_VERSION', sysid, compid, left)
+            if v is None:
+                break
+            found.setdefault(bytes(v.uid2[:12]).hex().upper(), v)
+        if found:
+            return list(found.values())
+    return []
+
+
+def refuse_shared_sysid(uids, sysid, compid):
+    """Exit with the refusal when more than one board answers as (sysid, compid)."""
+    if len(uids) > 1:
+        sys.exit(f"REFUSED: {len(uids)} flight controllers answer as system {sysid} "
+                 f"component {compid} on this link (uids {', '.join(uids)}). "
+                 f"Give each its own system id (MAV_SYSID on 4.7, SYSID_THISMAV before 4.7).")
+
+
 class FC:
     def __init__(self, device, baud):
         self.m = mavutil.mavlink_connection(device, baud=baud, source_system=250,
@@ -131,23 +185,21 @@ class FC:
             sys.exit("REFUSED: no fresh heartbeat from the FC, so its armed state is unknown")
         return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
-    def version(self):
-        for _ in range(3):
-            self.m.mav.command_long_send(self.sysid, self.compid,
-                                         mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
-                                         mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
-                                         0, 0, 0, 0, 0, 0)
-            v = self.m.recv_match(type='AUTOPILOT_VERSION', blocking=True, timeout=4)
-            if v:
-                fv = v.flight_sw_version
-                return {
-                    'version': f"{(fv >> 24) & 0xff}.{(fv >> 16) & 0xff}.{(fv >> 8) & 0xff}",
-                    'git': bytes(v.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip(),
-                    'board': v.board_version >> 16,
-                    'board_version': v.board_version,
-                    'uid': bytes(v.uid2[:12]).hex().upper(),
-                }
-        sys.exit("no AUTOPILOT_VERSION")
+    def versions(self):
+        """One dict per distinct board answering as the pinned (sysid, compid)."""
+        out = []
+        for v in autopilot_versions(self.m, self.sysid, self.compid):
+            fv = v.flight_sw_version
+            out.append({
+                'version': f"{(fv >> 24) & 0xff}.{(fv >> 16) & 0xff}.{(fv >> 8) & 0xff}",
+                'git': bytes(v.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip(),
+                'board': v.board_version >> 16,
+                'board_version': v.board_version,
+                'uid': bytes(v.uid2[:12]).hex().upper(),
+            })
+        if not out:
+            sys.exit("no AUTOPILOT_VERSION")
+        return out
 
     def read(self, name, tries=4, timeout=1.5):
         """(value, type) or None if the firmware has no such name."""
@@ -155,8 +207,8 @@ class FC:
             self.m.mav.param_request_read_send(self.sysid, self.compid, name.encode(), -1)
             end = time.time() + timeout
             while time.time() < end:
-                msg = self.m.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.3)
-                if msg and msg.param_id == name and msg.get_srcSystem() == self.sysid:
+                msg = recv_from(self.m, 'PARAM_VALUE', self.sysid, self.compid, 0.3)
+                if msg and msg.param_id == name:
                     return float(msg.param_value), msg.param_type
         return None
 
@@ -165,16 +217,19 @@ class FC:
             self.m.mav.param_set_send(self.sysid, self.compid, name.encode(), float(value), ptype)
             end = time.time() + timeout
             while time.time() < end:
-                msg = self.m.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.3)
-                if msg and msg.param_id == name and msg.get_srcSystem() == self.sysid:
+                msg = recv_from(self.m, 'PARAM_VALUE', self.sysid, self.compid, 0.3)
+                if msg and msg.param_id == name:
                     return float(msg.param_value)
         return None
 
 
 def check_identity(fc, a):
-    v = fc.version()
-    print(f"FC: ArduPilot {v['version']} git {v['git']} board {v['board']} "
-          f"uid {v['uid']} sysid {fc.sysid}")
+    vs = fc.versions()
+    for v in vs:
+        print(f"FC: ArduPilot {v['version']} git {v['git']} board {v['board']} "
+              f"uid {v['uid']} sysid {fc.sysid}")
+    refuse_shared_sysid([v['uid'] for v in vs], fc.sysid, fc.compid)
+    v = vs[0]
     bad = []
     if a.expect_uid and v['uid'] != a.expect_uid.upper():
         bad.append(f"uid {v['uid']} is not the expected {a.expect_uid.upper()}")
@@ -249,8 +304,8 @@ def main():
         fc.m.mav.command_long_send(fc.sysid, fc.compid,
                                    mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 0,
                                    1, 0, 0, 0, 0, 0, 0)
-        ack = fc.m.recv_match(type='COMMAND_ACK', blocking=True, timeout=5,
-                              condition='COMMAND_ACK.command==246')
+        ack = recv_from(fc.m, 'COMMAND_ACK', fc.sysid, fc.compid, 5,
+                        condition='COMMAND_ACK.command==246')
         res = None if ack is None else ack.result
         print(f"reboot: ACK result {res} (0 = accepted)")
         return 0 if res == 0 else 1
