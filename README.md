@@ -31,10 +31,10 @@ to 2 (fixed upstream in 2.4.50).
 | `ap-param-dump.py` | Dumps a board's parameters and its own defaults over MAVFTP. The defaults are what tell "this setting was lost" from "this parameter's default moved". Read-only. | `pymavlink` |
 | `ap-upgrade-verify.py` | Offline: checks that a firmware upgrade carried every setting across, from dumps taken before and after and a rename table. Tells a failed conversion from a default that moved under an unstored parameter. | stdlib |
 | `ap-param-apply.py` | Writes parameter files to one flight controller, pinned by its unique id, firmware hash and board id, and reads every write back. Refuses a name the firmware does not have. | `pymavlink` |
-| `ap-ftp-get.py` | Read-only MAVFTP download from an ArduPilot flight controller, checked against the board's own CRC32. Built for slow, deep-buffered links (USB/IP over a VPN, a telemetry radio), where pymavlink's `cmd_get` gives up and then discards every reply. It sends nothing that writes to the vehicle. | `pymavlink` |
+| `ap-ftp-get.py` | Read-only MAVFTP download from an ArduPilot flight controller, checked against the board's own CRC32 (a transport check, not proof of where the bytes came from). Built for slow, deep-buffered links (USB/IP over a VPN, a telemetry radio), where pymavlink's `cmd_get` gives up and then discards every reply. It sends nothing that writes to the vehicle. | `pymavlink` |
 | `mavlink-listen.py` | Listen-only MAVLink check over TCP or UDP: prints the autopilot's heartbeat and a count per message id. Never sends MAVLink. | stdlib |
 | `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. | `pyserial` |
-| `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing` or `invalid`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
+| `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing`, `invalid` or `unchecked`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
 
 Without `--device` or `--port`, `ap-ftp-get.py`, `ap-param-dump.py` and
 `bf-cli.py` look in `/dev/serial/by-id` (Linux only); the last two then fall
@@ -101,7 +101,7 @@ no file may set.
     ap-ftp-get.py /APM/LOGS/00000011.BIN out/
     ap-ftp-get.py --list /APM/LOGS
     ap-ftp-get.py --last-log out/        # the log LASTLOG.TXT names
-    ap-ftp-get.py ... --device /dev/ttyACM0 --baud 115200 --stall 5
+    ap-ftp-get.py ... --device /dev/ttyACM0 --baud 115200 --stall 5 --max-mib 2048
     ap-ftp-get.py --selftest             # offline, stdlib only
 
 A directory given with a trailing `/`, or to `--last-log`, is created if
@@ -109,6 +109,21 @@ it does not exist. The tool resets the board's MAVFTP sessions first, so
 a transfer another ground station has open on the same vehicle will fail.
 The script's docstring explains why pymavlink's own download fails on these
 links and what this one does instead.
+
+It takes replies only from the system and component of the first autopilot
+heartbeat it sees on the link, and only when they are addressed to it. That
+filters out other devices on a shared link (a ground station, a gimbal, a
+companion computer), but any sender can claim those ids, so it is not
+authentication. It stores a chunk only if the chunk lies inside the size the
+board announced, starts on a 239-byte boundary and carries as many bytes as
+its header says, and it refuses a file larger than `--max-mib` before
+allocating memory. `VERIFIED` means the board's CRC32 matches the bytes
+received. That catches a corrupted transfer, but the CRC comes over the same
+link, so it does not prove the source. MAVLink signing would, and this tool
+neither signs nor checks signatures. On a CRC mismatch, or no CRC reply at
+all, the bytes are kept beside the target as `.crc-mismatch`. File
+names in `--list` output are printed with control characters shown as
+`\xNN` text.
 
 ## mavlink-listen.py
 
@@ -162,19 +177,35 @@ those letters, checked at Betaflight 2026.6.2). Lines that only set context
 or carry no setting (`batch`, `defaults`, `save`, `board_name`, `profile`
 and the like) are skipped. It exits 0 when every `set` line is `same` and
 there is no `by-hand` line, 1 otherwise (including a backup with no `set`
-lines), 2 on unreadable input. The script's docstring describes the output.
+lines), 2 on unreadable input. A setting whose limits cannot be read from
+the newer capture (an `Allowed range`, `String length` or `Array length`
+line that does not parse, or no limits at all) is `unchecked` (or `changed`,
+if its limits also differ between the captures), never `same`. Where the
+newer capture gives a numeric `Allowed range`, a value that is not a plain
+decimal number (`1_0`, `inf`) is `invalid`. Lines end at `\n` (one trailing
+`\r` is dropped, so CRLF backups parse) and fields are separated by space or
+tab, not by other Unicode spaces. Text from the files is printed with control
+characters shown as `\xNN`, so a capture cannot move the cursor or send
+terminal escape sequences. The script's
+docstring describes the output.
 
 ## log-fmt-diff.py
 
     log-fmt-diff.py OLD.BIN NEW.BIN [--markdown out.md] [--json out.json]
                     [--types MSG,CTUN,...] [--all-types]
                     [--label-old 4.6.3] [--label-new 4.7.1]
+    log-fmt-diff.py --selftest
 
 By default it compares the types listed in `DEFAULT_TYPES` in the script;
 `--all-types` compares every type either log defines. A type present in
 one log and not the other is reported, not dropped. Each log is read into
 memory and parsed in one pass, so comparing two 300 MB logs needs about
-600 MB of RAM.
+600 MB of RAM. Malformed records (a format that declares an impossible
+length, or a FMTU, UNIT or MULT record of the wrong size) are skipped, not
+trusted. Strings from the log are escaped on the terminal and in the Markdown
+report, so a log someone sent you cannot send terminal escape sequences or
+add Markdown headings, tables or inline links. A bare URL in the log
+stays a bare URL, and GitHub will still make it clickable.
 
 ## Licence
 

@@ -3,7 +3,8 @@
 # Copyright (C) 2026 Joe Fernandez
 """Read-only MAVFTP download from an ArduPilot flight controller, built for a
 slow, deep-buffered link (USB/IP over a VPN, a telemetry radio), and
-verified against the board's own CRC.
+verified against the board's own CRC: a transport check, not proof of the
+source.
 
 Why not pymavlink's MAVFTP.cmd_get: over USB/IP across a VPN it
 failed every time on a 5 MB log. ArduPilot answers one BurstReadFile with up to
@@ -15,6 +16,17 @@ reply, including the ones it asked for, as "unexpected burst" or "wrong session"
 This tool resets the FC's sessions, drains the link until it is quiet, opens
 once with a long timeout, takes every reply by offset whatever its burst, and
 re-asks from the first gap when a burst ends or stalls.
+
+VERIFIED means the board's CRC matches the bytes received from the heartbeat
+peer. It is a transport check (nothing was lost or reordered), not proof of the
+source: anything that can inject MAVLink on the link and speak as the vehicle can
+satisfy it. Replies are accepted only from the system and component of the
+first autopilot heartbeat seen on the link, and only when addressed to this
+connection; the rest are skipped and counted. That filters out other devices
+on a shared link (a ground station, a gimbal, a companion computer), but any
+sender can claim those ids, so it is not authentication. MAVLink signing is
+the only provenance control, and this tool neither signs nor checks
+signatures.
 
 Only OpenFileRO, BurstReadFile, CalcFileCRC32, ListDirectory, TerminateSession
 and ResetSessions are sent: nothing that writes to the vehicle. ResetSessions
@@ -44,6 +56,14 @@ OP_TERM, OP_RESET, OP_LIST, OP_OPEN_RO, OP_CRC, OP_BURST = 1, 2, 3, 4, 14, 15
 ACK, NACK = 128, 129
 ERR_EOF = 6  # MAV_FTP_ERR_EOF, the error code of the NACK that ends a read
 CH = 239  # bytes of data per FILE_TRANSFER_PROTOCOL reply
+MAX_BYTES = 2 << 30  # default cap on one download
+
+
+def inert(s):
+    """`s` with every C0 control, DEL and C1 control character shown as \\xNN
+    (lowercase hex), so text from the vehicle cannot drive the terminal."""
+    return ''.join('\\x%02x' % ord(c) if ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f else c
+                   for c in s)
 
 
 class FtpError(Exception):
@@ -72,17 +92,22 @@ def ap_crc32(data):
 
 class FtpSession:
     """One MAVFTP conversation over a pymavlink-like connection `m` (needs
-    m.mav.file_transfer_protocol_send, m.recv_match, m.target_system and
-    m.target_component). `stall` is the seconds of silence before a read is
-    re-asked; `log` takes one string."""
+    m.mav.file_transfer_protocol_send, m.mav.srcSystem, m.mav.srcComponent,
+    m.recv_match, m.target_system and m.target_component; a target_component of
+    0, which pymavlink leaves unset, accepts any component of the peer system). `stall` is the seconds of silence before a read is
+    re-asked; `log` takes one string. `max_bytes` caps one download. `dropped`
+    counts replies skipped because they did not come from the heartbeat peer or
+    were not addressed to this connection."""
 
     term_quiet = 3.0   # fetch's closing TerminateSession: seconds of quiet, and
     term_cap = 60      # the longest it waits for the link to go quiet
 
-    def __init__(self, m, stall=5.0, log=print):
+    def __init__(self, m, stall=5.0, log=print, max_bytes=MAX_BYTES):
         self.m = m
         self.stall = stall
         self.log = log
+        self.max_bytes = max_bytes
+        self.dropped = 0
         self.seq = 0
         self.last_size = 0   # bytes and seconds of the last successful fetch,
         self.last_dt = 0.0   # excluding the closing drain
@@ -94,9 +119,20 @@ class FtpSession:
             0, self.m.target_system, self.m.target_component, (hdr + data).ljust(251, b'\0'))
 
     def recv(self, timeout):
-        x = self.m.recv_match(type='FILE_TRANSFER_PROTOCOL', blocking=True, timeout=timeout)
-        if x is None:
-            return None
+        end = time.time() + timeout
+        while True:
+            x = self.m.recv_match(type='FILE_TRANSFER_PROTOCOL', blocking=True,
+                                  timeout=max(end - time.time(), 0.001))
+            if x is None:
+                return None
+            if (x.get_srcSystem() == self.m.target_system
+                    and self.m.target_component in (0, x.get_srcComponent())
+                    and x.target_system == self.m.mav.srcSystem
+                    and x.target_component == self.m.mav.srcComponent):
+                break
+            self.dropped += 1
+            if time.time() >= end:
+                return None
         b = bytes(x.payload).ljust(12, b'\0')
         _s, _sess, opc, size, req, bc, _, ofs = struct.unpack('<HBBBBBBI', b[:12])
         return dict(op=opc, size=size, req=req, bc=bc, ofs=ofs, data=b[12:12 + size])
@@ -148,7 +184,9 @@ class FtpSession:
     def crc(self, remote):
         """The board's CalcFileCRC32 of `remote`, or None."""
         r = self.ask(OP_CRC, remote, 60)
-        return struct.unpack('<I', r['data'][:4])[0] if r and r['op'] == ACK else None
+        if r and r['op'] == ACK and len(r['data']) >= 4:
+            return struct.unpack('<I', r['data'][:4])[0]
+        return None
 
     def fetch(self, remote, until_eof=False, timeout=None):
         """Read `remote` and return its bytes.
@@ -171,11 +209,16 @@ class FtpSession:
         deadline = None if timeout is None else time.time() + timeout
         r = self.ask(OP_OPEN_RO, remote, 15 if timeout is None else min(15, timeout))
         if not r or r['op'] != ACK:
-            raise FtpOpenError(f"open {remote} failed: {r and r['data'][:2]}")
+            why = inert(r['data'][:2].decode('latin-1')) if r else 'no reply'
+            raise FtpOpenError(f"open {inert(remote)} failed: {why}")
+        if len(r['data']) < 4:
+            raise FtpOpenError(f"open {inert(remote)}: reply too short")
         size = struct.unpack('<I', r['data'][:4])[0]
         if until_eof:
             self.log(f"open ok, {size} bytes announced (an estimate)")
             return self._read_to_eof(deadline)
+        if size > self.max_bytes:
+            raise FtpError(f"{inert(remote)}: {size} bytes announced, above the {self.max_bytes} cap")
         self.log(f"open ok, {size} bytes")
         buf = bytearray(size)
         have = set()
@@ -190,7 +233,9 @@ class FtpSession:
                 raise TimeoutError(f"{remote}: {len(have)} of {nchunks} chunks after {now - t0:.0f} s")
             if r is not None:
                 last_rx = now
-                if r['op'] == ACK and r['req'] == OP_BURST and r['size'] and r['ofs'] % CH == 0:
+                if (r['op'] == ACK and r['req'] == OP_BURST and 0 <= r['ofs'] < size
+                        and r['ofs'] % CH == 0
+                        and len(r['data']) == r['size'] == min(CH, size - r['ofs'])):
                     buf[r['ofs']:r['ofs'] + r['size']] = r['data']
                     have.add(r['ofs'])
                 done = r['req'] == OP_BURST and (r['bc'] or r['op'] == NACK)
@@ -203,6 +248,8 @@ class FtpSession:
                 gap = next(i * CH for i in range(nchunks) if i * CH not in have)
                 self.send(OP_BURST, CH, gap)
                 last_rx = now
+        if len(buf) != size or len(have) != nchunks:
+            raise FtpError(f"{inert(remote)}: {len(have)} of {nchunks} chunks, {len(buf)} of {size} bytes")
         self.last_dt = time.time() - t0
         self.last_size = size
         return bytes(buf)
@@ -232,7 +279,11 @@ class FtpSession:
             if r is not None:
                 last_rx = now
                 if r['req'] == OP_BURST:
-                    if r['op'] == ACK and r['size'] and r['ofs'] % CH == 0:
+                    if (r['op'] == ACK and r['size'] and r['ofs'] % CH == 0
+                            and len(r['data']) == r['size']
+                            and not (end is not None and r['ofs'] >= end)):
+                        if r['ofs'] + r['size'] > self.max_bytes:
+                            raise FtpError(f"more than {self.max_bytes} bytes, giving up")
                         chunks[r['ofs']] = r['data']
                         if r['size'] < CH and end is None:
                             end = r['ofs'] + r['size']
@@ -276,8 +327,16 @@ class FtpSession:
 # ---------------------------------------------------------------- selftest
 
 class _Msg:
-    def __init__(self, payload):
+    def __init__(self, payload, src=(1, 1), target=(250, 190)):
         self.payload = payload
+        self.src = src
+        self.target_system, self.target_component = target
+
+    def get_srcSystem(self):
+        return self.src[0]
+
+    def get_srcComponent(self):
+        return self.src[1]
 
 
 class _FakeFC:
@@ -288,13 +347,18 @@ class _FakeFC:
     data reply went out yet in the burst)."""
 
     def __init__(self, content, announced=None, burst=2000, drop=(), swallow=0,
-                 stale=0, nack_open=False):
+                 stale=0, nack_open=False, inject=(), forge=None, open_data=None,
+                 crc_data=None):
         self.content = content
         self.announced = len(content) if announced is None else announced
         self.burst = burst
         self.drop = set(drop)       # chunk offsets lost the first time they are sent
         self.swallow = swallow      # burst requests the FC ignores
         self.nack_open = nack_open
+        self.inject = list(inject)  # messages put on the line at the first burst request
+        self.forge = forge          # 'src' or 'target': a forged twin goes ahead of every burst reply
+        self.open_data = open_data  # bytes: replaces the OPEN ACK's data
+        self.crc_data = crc_data    # bytes: replaces the CRC ACK's data
         self.requests = []          # (op, size, offset) as the tool sent them
         self.nack_offsets = []
         self.q = [self._pkt(ACK, OP_BURST, CH, 0, b'\xaa' * CH) for _ in range(stale)]
@@ -302,6 +366,8 @@ class _FakeFC:
         fc = self
 
         class _Mav:
+            srcSystem, srcComponent = 250, 190
+
             def file_transfer_protocol_send(self, net, sysid, comp, payload):
                 fc._on_request(bytes(payload))
         self.mav = _Mav()
@@ -326,8 +392,14 @@ class _FakeFC:
             if self.nack_open:
                 self.q.append(self._pkt(NACK, op, 2, 0, bytes([10, 0])))
             else:
-                self.q.append(self._pkt(ACK, op, 4, 0, struct.pack('<I', self.announced)))
+                d = struct.pack('<I', self.announced) if self.open_data is None else self.open_data
+                self.q.append(self._pkt(ACK, op, len(d), 0, d))
+        elif op == OP_CRC:
+            d = struct.pack('<I', ap_crc32(self.content)) if self.crc_data is None else self.crc_data
+            self.q.append(self._pkt(ACK, op, len(d), 0, d))
         elif op == OP_BURST:
+            self.q.extend(self.inject)
+            self.inject = []
             if self.swallow > 0:
                 self.swallow -= 1
                 return
@@ -344,6 +416,11 @@ class _FakeFC:
                 if off in self.drop:
                     self.drop.discard(off)
                 else:
+                    if self.forge:
+                        bad = _Msg(self._pkt(ACK, op, len(chunk), off, b'\xee' * len(chunk), bc).payload,
+                                   src={'src': (2, 1), 'comp': (1, 2)}.get(self.forge, (1, 1)),
+                                   target=(251, 190) if self.forge == 'target' else (250, 190))
+                        self.q.append(bad)
                     self.q.append(self._pkt(ACK, op, len(chunk), off, chunk, bc))
                 if len(chunk) < CH:
                     off += len(chunk)
@@ -367,8 +444,8 @@ def _selftest():
             return fn
         return deco
 
-    def session(fc, stall=0.3):
-        s = FtpSession(fc, stall=stall, log=lambda *_: None)
+    def session(fc, stall=0.3, **kw):
+        s = FtpSession(fc, stall=stall, log=lambda *_: None, **kw)
         s.term_quiet = 0.05
         return s
 
@@ -523,6 +600,132 @@ def _selftest():
         assert zlib.crc32(b'123456789') == 0xCBF43926
         assert ap_crc32(b'123456789') != zlib.crc32(b'123456789')
 
+    pkt = _FakeFC._pkt
+
+    @case("known size: a chunk at or past the announced size yields no file")
+    def _():
+        fc = _FakeFC(blob(CH), swallow=10 ** 9,
+                     inject=[pkt(ACK, OP_BURST, CH, CH * 5, b'\xee' * CH, 1)])
+        try:
+            session(fc, stall=0.2).fetch('/x', timeout=0.8)
+        except (FtpError, TimeoutError):
+            pass
+        else:
+            raise AssertionError("a file came back")
+
+    @case("a chunk whose data length differs from its header size is ignored")
+    def _():
+        data = blob(CH * 3)
+        bad = pkt(ACK, OP_BURST, 250, 0, b'\xee' * 239)
+        fc = _FakeFC(data, inject=[bad], drop={0})
+        same(session(fc).fetch('/x'), data)
+        fc = _FakeFC(data, inject=[bad], drop={0})
+        same(session(fc).fetch('/x', until_eof=True), data)
+
+    @case("replies from another source, or addressed to another target, are dropped and counted")
+    def _():
+        data = blob(CH * 4 + 9)
+        for forge in ('src', 'comp', 'target'):
+            for eof in (False, True):
+                fc = _FakeFC(data, forge=forge)
+                s = session(fc)
+                same(s.fetch('/x', until_eof=eof), data)
+                assert s.dropped > 0, (forge, eof, s.dropped)
+
+    @case("target_component 0 (pymavlink never sets it) accepts any component of the peer system")
+    def _():
+        data = blob(CH * 2 + 5)
+        fc = _FakeFC(data)
+        fc.target_component = 0
+        s = session(fc)
+        same(s.fetch('/x'), data)
+        assert s.dropped == 0
+
+    @case("an announced size above max_bytes is refused before allocation")
+    def _():
+        fc = _FakeFC(blob(5000))
+        try:
+            session(fc, max_bytes=1000).fetch('/x')
+        except FtpError:
+            pass
+        else:
+            raise AssertionError("no FtpError")
+        assert not sent(fc, OP_BURST), fc.requests
+        assert fc.requests[-1][0] == OP_TERM
+
+    @case("a CRC ACK with an empty payload gives None")
+    def _():
+        fc = _FakeFC(blob(100), crc_data=b'')
+        assert session(fc).crc('/x') is None
+        fc = _FakeFC(blob(100), crc_data=b'\x01\x02')
+        assert session(fc).crc('/x') is None
+        data = blob(100)
+        assert session(_FakeFC(data)).crc('/x') == ap_crc32(data)
+
+    @case("an OPEN ACK with an empty payload raises FtpOpenError")
+    def _():
+        for eof in (False, True):
+            fc = _FakeFC(blob(100), open_data=b'')
+            try:
+                session(fc).fetch('/x', until_eof=eof)
+            except FtpOpenError:
+                pass
+            else:
+                raise AssertionError("no FtpOpenError")
+            assert fc.requests[-1][0] == OP_TERM
+
+    @case("until_eof: data past max_bytes raises FtpError")
+    def _():
+        fc = _FakeFC(blob(5000))
+        try:
+            session(fc, max_bytes=1000).fetch('/x', until_eof=True)
+        except FtpError:
+            pass
+        else:
+            raise AssertionError("no FtpError")
+
+    @case("until_eof: a chunk past a known end is ignored")
+    def _():
+        data = blob(CH + 10)
+        late = [pkt(ACK, OP_BURST, 10, CH, b'\x01' * 10, 1),     # fixes the end at 249
+                pkt(ACK, OP_BURST, CH, CH * 2, b'\xee' * CH),
+                pkt(ACK, OP_BURST, CH, CH * 3, b'\xee' * CH)]
+        fc = _FakeFC(data, inject=late)
+        same(session(fc, max_bytes=600).fetch('/x', until_eof=True)[:CH], data[:CH])
+
+    @case("inert maps ESC, BEL and CR, DEL and C1 to \\xNN and leaves the rest")
+    def _():
+        assert inert('a\x1b[2K\x07\rb') == 'a\\x1b[2K\\x07\\x0db'
+        assert inert('\x7f\x85\x9f') == '\\x7f\\x85\\x9f'
+        assert inert('plain \u00e9 text') == 'plain \u00e9 text'
+
+    @case("wait_autopilot skips GCS and gimbal heartbeats and pins the autopilot's system and component")
+    def _():
+        class _HB:
+            def __init__(self, sysid, comp, autopilot):
+                self.sc, self.autopilot = (sysid, comp), autopilot
+
+            def get_srcSystem(self):
+                return self.sc[0]
+
+            def get_srcComponent(self):
+                return self.sc[1]
+
+        class _Conn:
+            target_system = target_component = 0
+            q = [_HB(255, 190, MAV_AUTOPILOT_INVALID), _HB(1, 154, MAV_AUTOPILOT_INVALID),
+                 _HB(1, 1, 3)]
+
+            def recv_match(self, type=None, blocking=True, timeout=None):
+                return self.q.pop(0) if self.q else None
+        c = _Conn()
+        hb = wait_autopilot(c, 2)
+        assert hb is not None and (c.target_system, c.target_component) == (1, 1), \
+            (c.target_system, c.target_component)
+        c2 = _Conn()
+        c2.q = [_HB(255, 190, MAV_AUTOPILOT_INVALID)]
+        assert wait_autopilot(c2, 0.3) is None
+
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
@@ -538,6 +741,31 @@ def find_device():
     sys.exit("no flight controller found; pass --device")
 
 
+MAV_AUTOPILOT_INVALID = 8   # MAVLink common.xml: a heartbeat from something that is not an autopilot
+
+
+def wait_autopilot(m, timeout):
+    """Wait for an autopilot's heartbeat and pin the connection to its system and
+    component, for FtpSession's reply check. pymavlink sets only target_system,
+    and wait_heartbeat returns the first heartbeat of any kind: on a shared link
+    that can be a GCS, a gimbal or a companion computer, and pinning to its
+    component would drop every reply from the autopilot. Returns the heartbeat,
+    or None at the timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=max(0.1, deadline - time.time()))
+        if hb is None:
+            continue
+        if hb.autopilot == MAV_AUTOPILOT_INVALID:
+            continue
+        if m.target_system not in (0, hb.get_srcSystem()):
+            continue
+        m.target_system = hb.get_srcSystem()
+        m.target_component = hb.get_srcComponent()
+        return hb
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('remote', nargs='?', help='file on the FC, e.g. /APM/LOGS/00000011.BIN')
@@ -547,6 +775,8 @@ def main(argv=None):
     ap.add_argument('--device', help='default: first ArduPilot USB serial device (-if00)')
     ap.add_argument('--baud', type=int, default=115200)
     ap.add_argument('--stall', type=float, default=5.0, help='seconds of silence before re-asking (default 5)')
+    ap.add_argument('--max-mib', type=int, default=MAX_BYTES >> 20,
+                    help='refuse a file larger than this many MiB (default 2048)')
     ap.add_argument('--selftest', action='store_true', help='run the offline tests and exit')
     a = ap.parse_args(argv)
     if a.selftest:
@@ -574,10 +804,20 @@ def main(argv=None):
     dev = a.device or find_device()
     print(f"connecting to {dev} ...", flush=True)
     m = mavutil.mavlink_connection(dev, baud=a.baud, source_system=250, source_component=190)
-    if m.wait_heartbeat(timeout=25) is None:
-        sys.exit(f"no heartbeat on {dev}")
-    s = FtpSession(m, stall=a.stall, log=lambda t: print(t, flush=True))
+    hb = wait_autopilot(m, 25)
+    if hb is None:
+        sys.exit(f"no autopilot heartbeat on {dev}")
+    s = FtpSession(m, stall=a.stall, log=lambda t: print(t, flush=True),
+                   max_bytes=a.max_mib << 20)
+    try:
+        return _run(a, s)
+    finally:
+        if s.dropped:
+            print(f"skipped {s.dropped} replies not from the heartbeat peer or not addressed to this connection",
+                  file=sys.stderr, flush=True)
 
+
+def _run(a, s):
     def get(remote, local):
         try:
             buf = s.fetch(remote)
@@ -607,7 +847,7 @@ def main(argv=None):
             sys.exit(str(e))
         for e in entries:
             kind, rest = e[0], e[1:]
-            print(('dir  ' if kind == 'D' else 'file ') + rest.replace('\t', '  '))
+            print(('dir  ' if kind == 'D' else 'file ') + inert(rest.replace('\t', '  ')))
         s.terminate(drain=False)
         return 0
 
@@ -623,7 +863,8 @@ def main(argv=None):
             if x and x['req'] == OP_BURST and x['op'] == ACK:
                 txt = x['data']; break
         s.terminate(quiet=3.0, cap=30)
-        num = int(txt.strip() or b'0')
+        digits = txt.strip()
+        num = int(digits) if digits.isdigit() and len(digits) <= 8 else 0
         if num <= 0:
             sys.exit(f"LASTLOG.TXT unreadable: {txt!r}")
         a.remote = f'/APM/LOGS/{num:08d}.BIN'

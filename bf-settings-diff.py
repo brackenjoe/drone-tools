@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Joe Fernandez
-"""Compare the settings tables of two Betaflight builds and classify a `diff all`.
+r"""Compare the settings tables of two Betaflight builds and classify a `diff all`.
 
 Answers "which lines of this backup survive a firmware change" without
 flashing anything. Offline: reads text, touches no serial device.
@@ -29,11 +29,21 @@ Part 2, with --diff: one line per diff line:
            never as renames
   invalid  in both, attributes equal, value not valid in NEW; also a name in
            NEW but not in OLD whose value is not valid in NEW
+  unchecked  the name is in NEW but its NEW attributes cannot be checked: an
+           Allowed range, String length or Array length line did not parse, or
+           the block has no attribute lines; the note says which. A value that
+           fails an attribute that did parse is still `invalid` or `changed`
   by-hand  every other line (feature, serial, aux, resource, ...)
 Skipped, not classified: blank lines, `#` comments, and lines starting with
 batch, defaults, save, board_name, manufacturer_id, mcu_id or signature.
 `profile N` and `rateprofile N` lines are not classified either; they set the
 context (master, profile 2, ...) shown for the lines after them.
+Syntax is ASCII only: lines split on \n alone (one trailing \r dropped) and
+separators are space or tab, so a no-break space or \x0b does not parse as a
+set line. Where NEW gives a numeric `Allowed range`, a value must be plain
+decimal digits (no 1_0, inf, nan, wide digits), else it is `invalid`. Everything taken from the input is
+printed with control characters shown as \xNN, so a file cannot move the
+cursor or add table columns.
 Exit 0 if every classified line is `same` and there is no `by-hand` line, 1
 otherwise; a diff with no `set` lines exits 1, since at least one `same` is
 required. 2 on unreadable input.
@@ -44,32 +54,50 @@ import re
 import sys
 
 NAME_RE = re.compile(r'^([a-z0-9_]+) = (.*)$')
-NUM = r'(-?\d+(?:\.\d+)?)'
-RANGE_RE = re.compile(r'^' + NUM + r'\s+-\s+' + NUM + r'$')
+NUM = r'(-?[0-9]+(?:\.[0-9]+)?)'
+NUM_RE = re.compile(NUM)
+RANGE_RE = re.compile(r'^' + NUM + r'[ \t]+-[ \t]+' + NUM + r'$')
 ATTR_PREFIX = (('Allowed range:', 'range'), ('Allowed values:', 'values'),
                ('Array length:', 'array'), ('String length:', 'string'))
 IGNORED = {'batch', 'defaults', 'save', 'board_name', 'manufacturer_id',
            'mcu_id', 'signature', 'profile', 'rateprofile'}
-SET_RE = re.compile(r'^set\s+([a-z0-9_]+)\s*=\s?(.*)$')
+# Hypothesis, not checked against the firmware: the Betaflight CLI splits on
+# plain space and tab only, so set<NBSP>name = 1 would be rejected on the board.
+SET_RE = re.compile(r'^set[ \t]+([a-z0-9_]+)[ \t]*=[ \t]?(.*)$')
+WS = ' \t'
+
+
+def inert(s):
+    """s with every C0, DEL and C1 control character shown as \\xNN."""
+    return ''.join('\\x%02x' % ord(c) if ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f else c
+                   for c in s)
+
+
+def split_lines(text):
+    """Split on \\n only, dropping one trailing \\r from each line."""
+    return [ln[:-1] if ln.endswith('\r') else ln for ln in text.split('\n')]
+
+
+def is_num(s):
+    return NUM_RE.fullmatch(s) is not None
 
 
 def parse_range(text):
-    m = RANGE_RE.match(text.strip())
+    m = RANGE_RE.match(text.strip(WS))
     if m:
         return (float(m.group(1)), float(m.group(2)))
-    return text.strip()
+    return text.strip(WS)
 
 
 def parse_attr(kind, text):
-    text = text.strip()
+    text = text.strip(WS)
     if kind == 'range' or kind == 'string':
         return parse_range(text)
     if kind == 'values':
-        return tuple(v.strip().upper() for v in text.split(','))
-    try:
+        return tuple(v.strip(WS).upper() for v in text.split(','))
+    if re.fullmatch(r'[0-9]+', text):
         return int(text)
-    except ValueError:
-        return text
+    return text
 
 
 def parse_capture(text, label='capture', warn=None):
@@ -92,8 +120,8 @@ def parse_capture(text, label='capture', warn=None):
             table[name] = attrs
         cur = None
 
-    for raw in text.splitlines():
-        line = raw.strip()
+    for raw in split_lines(text):
+        line = raw.strip(WS)
         if not line:
             close()
             continue
@@ -160,14 +188,13 @@ def attr_changes(old, new):
 def check_scalar(v, attrs):
     """None if v is valid for one element under attrs, else the reason."""
     if 'values' in attrs:
-        if v.strip().upper() not in attrs['values']:
+        if v.strip(WS).upper() not in attrs['values']:
             return f"'{v}' not in allowed values"
     r = attrs.get('range')
     if isinstance(r, tuple):
-        try:
-            x = float(v)
-        except ValueError:
+        if not is_num(v.strip(WS)):
             return f"'{v}' is not numeric"
+        x = float(v.strip(WS))
         if not (r[0] <= x <= r[1]):
             return f"{v} outside {fmt_range(r)}"
     return None
@@ -176,7 +203,7 @@ def check_scalar(v, attrs):
 def validate(value, attrs):
     """None if value is valid under attrs, else the reason."""
     if 'array' in attrs:
-        items = [s.strip() for s in value.split(',')]
+        items = [s.strip(WS) for s in value.split(',')]
         n = attrs['array']
         if isinstance(n, int) and len(items) != n:
             return f"{len(items)} elements, array length {n}"
@@ -193,15 +220,28 @@ def validate(value, attrs):
     return check_scalar(value, attrs)
 
 
+def unchecked_why(attrs):
+    """None if every attribute of a NEW block is usable, else what is not."""
+    if not attrs:
+        return 'NEW has no attribute lines for it'
+    bad = [lab for kind, lab in (('range', 'Allowed range'), ('string', 'String length'))
+           if kind in attrs and not isinstance(attrs[kind], tuple)]
+    if 'array' in attrs and not isinstance(attrs['array'], int):
+        bad.append('Array length')
+    if bad:
+        return 'NEW ' + ', '.join(bad) + ' line could not be read'
+    return None
+
+
 def classify_diff(text, old, new):
     """Yield (lineno, context, class, name, value, note) for each reported line."""
     new_only = sorted(set(new) - set(old))
     ctx = 'master'
-    for no, raw in enumerate(text.splitlines(), 1):
-        line = raw.strip()
+    for no, raw in enumerate(split_lines(text), 1):
+        line = raw.strip(WS)
         if not line or line.startswith('#'):
             continue
-        word = line.split()[0]
+        word = re.split(r'[ \t]', line)[0]
         if word in ('profile', 'rateprofile'):
             ctx = line
             continue
@@ -211,7 +251,7 @@ def classify_diff(text, old, new):
         if not m:
             yield (no, ctx, 'by-hand', '', line, '')
             continue
-        name, value = m.group(1), m.group(2).strip()
+        name, value = m.group(1), m.group(2).strip(WS)
         if name not in new:
             sugg = difflib.get_close_matches(name, new_only, n=3)
             note = ('not in NEW; similar NEW-only names (suggestions, not renames): '
@@ -223,16 +263,25 @@ def classify_diff(text, old, new):
         if name not in old:
             # in NEW only: nothing to compare against; judge it by NEW alone
             why = validate(value, new[name])
-            yield (no, ctx, 'invalid' if why else 'same', name, value,
-                   ('not in OLD capture; ' + why) if why else 'not in OLD capture; valid in NEW')
+            un = unchecked_why(new[name])
+            if why:
+                yield (no, ctx, 'invalid', name, value, 'not in OLD capture; ' + why)
+            elif un:
+                yield (no, ctx, 'unchecked', name, value, 'not in OLD capture; ' + un)
+            else:
+                yield (no, ctx, 'same', name, value, 'not in OLD capture; valid in NEW')
             continue
         why = validate(value, new[name])
+        un = unchecked_why(new[name])
         if old[name] != new[name]:
             ch = '; '.join(attr_changes(old[name], new[name]))
-            note = ch + ('; value INVALID under NEW: ' + why if why else '; value valid under NEW')
+            note = ch + ('; value INVALID under NEW: ' + why if why else
+                         '; value valid under NEW' if not un else '; value not checked: ' + un)
             yield (no, ctx, 'changed', name, value, note)
         elif why:
             yield (no, ctx, 'invalid', name, value, why)
+        elif un:
+            yield (no, ctx, 'unchecked', name, value, un)
         else:
             yield (no, ctx, 'same', name, value, '')
 
@@ -245,15 +294,15 @@ def table_report(old, new, out):
           f"only in NEW {len(only_new)}, attributes differ {len(changed)}", file=out)
     print(f"\n== only in OLD (removed or renamed): {len(only_old)}", file=out)
     for n in only_old:
-        print(f"  {n}    [{fmt_attrs(old[n])}]", file=out)
+        print(f"  {n}    [{inert(fmt_attrs(old[n]))}]", file=out)
     print(f"\n== only in NEW (added): {len(only_new)}", file=out)
     for n in only_new:
-        print(f"  {n}    [{fmt_attrs(new[n])}]", file=out)
+        print(f"  {n}    [{inert(fmt_attrs(new[n]))}]", file=out)
     print(f"\n== attributes differ: {len(changed)}", file=out)
     for n in changed:
         print(f"  {n}", file=out)
         for c in attr_changes(old[n], new[n]):
-            print(f"      {c}", file=out)
+            print(f"      {inert(c)}", file=out)
 
 
 def read(path):
@@ -266,7 +315,7 @@ def run(old_text, new_text, diff_text, out, err):
 
     def warn(m):
         warns.append(m)
-        print('warning: ' + m, file=err)
+        print('warning: ' + inert(m), file=err)
 
     old = parse_capture(old_text, 'OLD', warn)
     new = parse_capture(new_text, 'NEW', warn)
@@ -277,10 +326,11 @@ def run(old_text, new_text, diff_text, out, err):
     if diff_text is None:
         return 0, {}
     print("\n== diff lines  (line  context  class  name  value  note)", file=out)
-    counts = {'same': 0, 'changed': 0, 'missing': 0, 'invalid': 0, 'by-hand': 0}
+    counts = {'same': 0, 'changed': 0, 'missing': 0, 'invalid': 0, 'unchecked': 0,
+              'by-hand': 0}
     for no, ctx, cls, name, value, note in classify_diff(diff_text, old, new):
         counts[cls] += 1
-        print(f"{no}\t{ctx}\t{cls}\t{name}\t{value}\t{note}", file=out)
+        print(f"{no}\t{inert(ctx)}\t{cls}\t{name}\t{inert(value)}\t{inert(note)}", file=out)
     print("\n== summary: " + ', '.join(f"{k} {v}" for k, v in counts.items()), file=out)
     return (0 if counts['same'] and sum(counts.values()) == counts['same'] else 1), counts
 
@@ -476,7 +526,7 @@ save
     case('ignored: header, batch, defaults, board, profile, save lines not reported',
          sum(counts.values()) == sum(len(v) for v in rows.values())
          and not any('board_name' in k[1] or 'batch' in k[1] or k[1].startswith('save') for k in rows))
-    case('counts', counts == {'same': 9, 'changed': 5, 'missing': 2, 'invalid': 6, 'by-hand': 3}, counts)
+    case('counts', counts == {'same': 9, 'changed': 5, 'missing': 2, 'invalid': 6, 'unchecked': 0, 'by-hand': 3}, counts)
     case('exit 1 when anything is not same', rc == 1)
 
     ok_diff = "profile 1\nset alpha_int = 5\nset name_str = abc\n"
@@ -488,6 +538,68 @@ save
     case('exit 2 when no settings parse', rc2 == 2)
     rc3, _ = run(old_t, new_t, None, io.StringIO(), io.StringIO())
     case('no --diff: table only, exit 0', rc3 == 0)
+
+    # hardening: escaping, unchecked class, ASCII-only syntax, strict numbers
+    ESC = '\x1b'
+    cap = "a_int = 1\nAllowed range: 0 - 10\n\nb_str = x\nString length: 1 - 4\n"
+    ebuf, eerr = io.StringIO(), io.StringIO()
+    run(cap, cap + "c_bad = 1\nString length: 1 - 4" + ESC + "[2J\n",
+        f"feature {ESC}[2K\nprofile 1{ESC}[1A\nset a_int = 5{ESC}[1A\nset a_int = 99{ESC}[H\n",
+        ebuf, eerr)
+    ereport = ebuf.getvalue()
+    case('escape: ESC shown as \\x1b text in by-hand, profile and set value',
+         ESC not in ereport and ereport.count('\\x1b') >= 5, repr(ereport))
+    abuf = io.StringIO()
+    run(cap + "z_q = 1\nAllowed range: 0 - 1" + ESC + "[2J\n",
+        cap + "z_q = 1\nAllowed range: 0 - 2" + ESC + "[2J\n", None, abuf, io.StringIO())
+    case('escape: ESC in a capture attribute line shown as text',
+         ESC not in abuf.getvalue() and '\\x1b' in abuf.getvalue(), repr(abuf.getvalue()))
+    ebuf2, eerr2 = io.StringIO(), io.StringIO()
+    run("dd_x = 1\nAllowed range: 0 - 1\n\ndd_x = 1\nAllowed range: 0 - 2" + ESC + "[2J\n",
+        cap, None, ebuf2, eerr2)
+    case('escape: ESC in the duplicate-block warning shown as text',
+         ESC not in eerr2.getvalue() and '\\x1b' in eerr2.getvalue(), repr(eerr2.getvalue()))
+    tbuf = io.StringIO()
+    run(cap, cap, "set b_str = a\tb\n", tbuf, io.StringIO())
+    trow = [r for r in tbuf.getvalue().split('\n') if r.startswith('1\t')]
+    case('tab in a set value does not add a column',
+         len(trow) == 1 and len(trow[0].split('\t')) == 6 and '\\x09' in trow[0], trow)
+
+    def one(new_cap, diff, old_cap=None):
+        b = io.StringIO()
+        rc_, c_ = run(old_cap or new_cap, new_cap, diff, b, io.StringIO())
+        return rc_, c_, b.getvalue()
+    urc, uc, _ = one("u_n = 1\nAllowed range: 0 to 10\n", "set u_n = 5\n")
+    case('unchecked: unparsable NEW range, exit 1',
+         uc.get('unchecked') == 1 and uc['same'] == 0 and urc == 1, (urc, uc))
+    _, uc3, _ = one("u_s = 1\nString length: x\n", "set u_s = a\n")
+    _, uc4, _ = one("u_a = 1,2\nArray length: x\n", "set u_a = 1,2\n")
+    case('unchecked: unparsable String length and Array length',
+         uc3.get('unchecked') == 1 and uc4.get('unchecked') == 1, (uc3, uc4))
+    nrc, nc, nrep = one("n_a = 1\n\nn_b = 1\nAllowed range: 0 - 1\n", "set n_a = 1\n")
+    case('unchecked: NEW block with no attribute lines',
+         nc.get('unchecked') == 1 and nc['same'] == 0 and nrc == 1 and 'no attribute' in nrep, (nrc, nc))
+    _, nc2, _ = one("n_a = 1\n\nn_b = 1\nAllowed range: 0 - 1\n", "set n_a = 1\n",
+                    "n_b = 1\nAllowed range: 0 - 1\n")
+    case('unchecked: NEW-only name with no attributes', nc2.get('unchecked') == 1, nc2)
+    _, bc, _ = one("n_b = 1\nAllowed range: 0 - 1\n", "set n_b = 5\n")
+    case('unchecked: a readable attribute that fails still gives invalid', bc['invalid'] == 1, bc)
+    _, xc, _ = one("n_b = 1\nAllowed range: 0 - 9\n", "set\u00a0n_b = 1\n")
+    case('ascii: set<NBSP>name = 1 is not same', xc['same'] == 0 and xc['by-hand'] == 1, xc)
+    odd = [one("n_b = 1\nAllowed range: 0 - 9\n", f"set{c}n_b = 1\n")[1]['same']
+           for c in '\x0b\x1c\x85\u2028']
+    case('ascii: \\x0b, \\x1c, \\x85, U+2028 do not make a set line', odd == [0, 0, 0, 0], odd)
+    crlf = one("n_b = 1\r\nAllowed range: 0 - 9\r\n", "set n_b = 3\r\n")
+    case('ascii: CRLF line ends still parse', crlf[1]['same'] == 1, crlf[1])
+    _, wc, _ = one("w_i = 1\nAllowed range: 0 - 99\n", "set w_i = 1_0\n")
+    case('number: 1_0 against an integer range is invalid', wc['invalid'] == 1 and wc['same'] == 0, wc)
+    others = [one("w_i = 1\nAllowed range: 0 - 99\n", f"set w_i = {v}\n")[1]['invalid']
+              for v in ('inf', 'nan', '\uff11\uff10', '1e1', '+5', '.5')]
+    case('number: inf, nan, wide digits, 1e1, +5, .5 are invalid', others == [1] * 6, others)
+    case('number: plain negative and decimal still valid',
+         one("w_f = 1\nAllowed range: -1.5 - 2\n", "set w_f = -0.25\n")[1]['same'] == 1)
+    case('number: wide digits in a range line leave it unchecked',
+         one("w_i = 1\nAllowed range: \uff10 - \uff19\uff19\n", "set w_i = 5\n")[1].get('unchecked') == 1)
 
     failed = results.count(False)
     print(f"{len(results) - failed} passed, {failed} failed")
