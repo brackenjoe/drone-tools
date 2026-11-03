@@ -278,6 +278,64 @@ report, so a log someone sent you cannot send terminal escape sequences or
 add Markdown headings, tables or inline links. A bare URL in the log
 stays a bare URL, and GitHub will still make it clickable.
 
+## Over USB/IP from a phone
+
+A flight controller in the field can be plugged into an Android phone and
+shared with a Linux host over a VPN, using
+[usbip-dialin](https://github.com/brackenjoe/Android-Usbipdcpp/tree/main/linux/usbip-dialin)
+and the [Android-Usbipdcpp fork](https://github.com/brackenjoe/Android-Usbipdcpp)
+it ships with. The phone dials out and the host never connects to the
+phone. On the host the board is an ordinary USB serial device, so the
+tools run unchanged with `--device /dev/serial/by-id/...-if00`. Such a
+link is slow and deep-buffered. `ap-ftp-get.py` was built for it, and
+`ap-param-dump.py` uses its transfer; the other ArduPilot tools work over
+it as over a cable.
+
+Measured over that link:
+
+- 2026-10-20, a TBS Lucid H7 Wing on ArduPlane 4.8.0-dev (`8555d941`),
+  `ap-ftp-get.py` as it was then: about 18 KiB/s (17.7 to 18.9 over five
+  log transfers). A 5 MB log took about 4.5 minutes and its CRC matched.
+  After a transfer was killed on purpose, 798 replies from it were still
+  arriving. The next run drained them in 13.4 s and carried on.
+  pymavlink 2.4.49's own MAVFTP download failed in four of four attempts
+  on one log: its 1 s open retry changes session and throws away the
+  replies that follow.
+- 2026-11-03, a TBS Lucid H7 on ArduCopter 4.7.1, the tools as published
+  here: `ap-param-dump.py --defaults --health` read 1301 parameters and
+  the board's defaults in 76 s, 60 s of it the health window.
+  `ap-ftp-get.py --list` paged through 32 entries in 5.2 s.
+
+**In use.** On 2026-10-22 an ArduPlane aircraft (a Skyhunter 1800, the
+Lucid H7 Wing above) was tuned in three flights in one morning this way,
+with nothing on the flight controller but the phone. The work on the host
+was done by a Claude Code session, driven by Remote Control from the
+Claude app on the same phone that carried the USB/IP connection. Between
+flights the pilot plugged the phone in, started the app's server and told
+the session the aircraft was up. The session pulled the last flight's log
+with `ap-ftp-get.py`, analysed it and proposed the next parameters. On the
+pilot's yes it wrote them with `ap-param-apply.py`, pinned to the board's
+uid and firmware, and read each one back. Then it said what to fly next.
+The third flight ran
+AUTOTUNE, which saves its own gains. Not everything went cleanly that
+day. After a 400 s timeout of an earlier `ap-param-dump.py`, the board's
+MAVFTP stopped answering, even to `--list`, while parameter reads still
+worked, and a power cycle cleared it. pymavlink 2.4.49 crashed once at
+connect; 2.4.50 fixes that.
+
+What it does not do:
+
+- No firmware flashing. A board that re-enumerates as its bootloader
+  drops the connection.
+- No MAVLink signing. The tools take replies by system and component id,
+  which filters other devices on a link but does not authenticate them.
+  Who may attach a device at all is usbip-dialin's job, in layers. It
+  always checks the peer's VPN identity: the user is required, a single
+  device optional. With `--psk-file` it checks a key, which the fork's
+  app keeps behind a fingerprint. It authorises every device except
+  keyboards and other input devices, network adapters, Bluetooth and,
+  for now, audio. Its README has the details.
+
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE). The dependencies keep their own
