@@ -1,14 +1,16 @@
 # drone-tools
 
 Small command-line tools for ArduPilot and Betaflight. Each is one Python
-file, except that `ap-param-dump.py` needs `ap-ftp-get.py` beside it and
-`bf-cli-sitl-check.sh` is `bf-cli.py`'s test. Clone the repo and run a tool
+file, except that `ap-param-dump.py` needs `ap-ftp-get.py` beside it,
+`bf-cli-sitl-check.sh` is `bf-cli.py`'s test, and `ap-sitl-check.py`, the
+test of the tools that talk to an ArduPilot board, needs
+`mavlink-slowlink.py` beside it. Clone the repo and run a tool
 with `python3`, for example `python3 log-fmt-diff.py OLD.BIN NEW.BIN`.
 Tested on Linux.
 
 ## Requirements
 
-Python 3. Five tools need only the standard library. The rest need one of
+Python 3. Six tools need only the standard library. The rest need one of
 these, installed from PyPI; nothing is bundled here:
 
 | package | for | upstream | licence |
@@ -33,6 +35,8 @@ to 2 (fixed upstream in 2.4.50).
 | `ap-param-apply.py` | Writes parameter files to one flight controller, pinned by its unique id, firmware hash and board id, and reads every write back. Refuses a name the firmware does not have. | `pymavlink` |
 | `ap-ftp-get.py` | Read-only MAVFTP download from an ArduPilot flight controller, checked against the board's own CRC32 (a transport check, not proof of where the bytes came from). Built for slow, deep-buffered links (USB/IP over a VPN, a telemetry radio), where pymavlink's `cmd_get` gives up and then discards every reply. It sends nothing that writes to the vehicle. | `pymavlink` |
 | `mavlink-listen.py` | Listen-only MAVLink check over TCP or UDP: prints the autopilot's heartbeat and a count per message id. Never sends MAVLink. | stdlib |
+| `mavlink-slowlink.py` | TCP proxy that stands in for a slow, deep-buffered MAVLink link between a ground tool and SITL: a rate and a latency, a buffer that outlives a killed client, whole MAVLink frames, and one link fanned out to several SITLs. Importable, with drop hooks, for tests. | stdlib |
+| `ap-sitl-check.py` | The test of the tools that talk to an ArduPilot board, against ArduCopter 4.7.1 SITL (see below). | `pymavlink`, a built SITL |
 | `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. | `pyserial` |
 | `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing`, `invalid` or `unchecked`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
 
@@ -186,6 +190,58 @@ names in `--list` output are printed with control characters shown as
 MAVLink, so a router that takes any sender as its peer starts streaming
 back. Exit 0 on an autopilot heartbeat (or on silence with
 `--expect-none`), 1 otherwise, 2 on a usage or connection error.
+
+## ap-sitl-check.py
+
+The test of `ap-ftp-get.py`, `ap-param-dump.py`, `ap-param-apply.py`,
+`ap-upgrade-verify.py` and `mavlink-listen.py` against ArduCopter 4.7.1
+SITL: 94 checks, about 7.5 minutes, no hardware. It needs ArduCopter SITL
+built from ArduPilot's `Copter-4.7.1` tag. Install ArduPilot's build
+prerequisites first, as its
+[BUILD.md](https://github.com/ArduPilot/ardupilot/blob/master/BUILD.md)
+describes (`Tools/environment_install/` has a script per platform); then,
+in the repo directory:
+
+    git clone --recurse-submodules --branch Copter-4.7.1 https://github.com/ArduPilot/ardupilot
+    (cd ardupilot && ./waf configure --board sitl && ./waf copter)
+    python3 ap-sitl-check.py
+
+It takes the binary from `ardupilot/build/sitl/bin/arducopter` and the
+defaults from the same tree; `AP_SITL` and `AP_DEFAULTS` point it
+elsewhere. Its exit status is the number of failed checks, at most 100.
+It exits 101, with a `cannot run:` line, if the SITL's git hash is not
+`dbe79216`, something holds TCP 5820-5823, 5830-5833 or 15820-15829, or a
+SITL dies during a case. It stops only the SITLs it started. `--tools DIR` runs another copy of the tools, which is how
+an older version can be shown to fail.
+
+The tools reach SITL through `mavlink-slowlink.py`: a 1800 B/s, 150 ms
+link, raised to 18,000 B/s (about a real USB/IP link's rate) for one case,
+and an unlimited one that drops chosen frames. Parameter reads and arming go to SITL
+directly, so every result is checked against what the board holds. What it
+covers:
+
+- `ap-ftp-get.py`: a listing that pages, a CRC-checked fetch, a burst reply
+  dropped on purpose and fetched again, `--last-log`, and a rerun through
+  replies still in flight from a killed transfer.
+- `ap-param-dump.py`: MAVFTP with defaults over the slow link, a killed and
+  rerun dump, the `PARAM_REQUEST_LIST` fallback, a short `--no-ftp` read
+  exiting 1, and `--health` leaving the position out unless asked.
+- `ap-upgrade-verify.py` on SITL dumps: "nothing unexplained", UNEXPLAINED,
+  carried across and MISMATCH, each with its exit code.
+- `ap-param-apply.py`: identify, plan, a write read back, `never-write.txt`,
+  a name the firmware lacks, each wrong pin, and arming before a write
+  (slow link) and during one (both links).
+- Two SITLs at one system id on one link: `ap-param-apply.py` and
+  `ap-param-dump.py` refuse, and neither board changes.
+- `mavlink-listen.py` sends nothing.
+
+What it cannot show: SITL does not pace MAVFTP bursts the way a board on a
+serial port does (SITL's UART reports flow control), so a killed transfer
+leaves the whole file in flight. `reboot` is not covered. The arm during a
+write is a race: on the 150 ms link the tool stops partway and says how
+far it got; on loopback the loop can finish first, and the check asserts
+that the tool then exits 1 with a warning, not how many writes landed
+armed.
 
 ## bf-cli.py
 
