@@ -1,22 +1,24 @@
 # drone-tools
 
 Small command-line tools for ArduPilot and Betaflight. Each is one Python
-file, except that `ap-param-dump.py` needs `ap-ftp-get.py` beside it,
-`bf-cli-sitl-check.sh` is `bf-cli.py`'s test, and `ap-sitl-check.py`, the
-test of the tools that talk to an ArduPilot board, needs
-`mavlink-slowlink.py` beside it. Clone the repo and run a tool
+file (`sitl.sh` is one bash file), except that `ap-param-dump.py` needs
+`ap-ftp-get.py` beside it, `bf-cli-sitl-check.sh` is `bf-cli.py`'s test, and
+`ap-sitl-check.py`, the test of the tools that talk to an ArduPilot board,
+needs `mavlink-slowlink.py` beside it. Clone the repo and run a tool
 with `python3`, for example `python3 log-fmt-diff.py OLD.BIN NEW.BIN`.
 Tested on Linux.
 
 ## Requirements
 
-Python 3. Six tools need only the standard library. The rest need one of
-these, installed from PyPI; nothing is bundled here:
+Python 3. Six of the Python tools need only the standard library;
+`sitl.sh` and `bf-cli-sitl-check.sh` are bash. The rest need one of these, installed from PyPI; nothing
+is bundled here:
 
 | package | for | upstream | licence |
 |---|---|---|---|
 | `pymavlink>=2.4.50` | the tools that talk to an ArduPilot board | [ArduPilot/pymavlink](https://github.com/ArduPilot/pymavlink) | LGPL-3.0 |
 | `pyserial>=3.5` | `bf-cli.py` | [pyserial/pyserial](https://github.com/pyserial/pyserial) | BSD-3-Clause |
+| `numpy>=1.26` | `vtol-yaw-metrics.py` | [numpy/numpy](https://github.com/numpy/numpy) | BSD-3-Clause |
 
     pip install -r requirements.txt
 
@@ -37,13 +39,21 @@ to 2 (fixed upstream in 2.4.50).
 | `mavlink-listen.py` | Listen-only MAVLink check over TCP or UDP: prints the autopilot's heartbeat and a count per message id. Never sends MAVLink. | stdlib |
 | `mavlink-slowlink.py` | TCP proxy that stands in for a slow, deep-buffered MAVLink link between a ground tool and SITL: a rate and a latency, a buffer that outlives a killed client, whole MAVLink frames, and one link fanned out to several SITLs. Importable, with drop hooks, for tests. | stdlib |
 | `ap-sitl-check.py` | The test of the tools that talk to an ArduPilot board, against ArduCopter 4.7.1 SITL (see below). | `pymavlink`, a built SITL |
+| `ap-version.py` | Prints a vehicle's firmware version and the git hash it was built from, over SITL, telemetry or USB. A dev version string is meaningless alone; the hash is what pins a matching source tree, and the tool prints the `git worktree add` line to make one. Exits 1 if more than one flight controller answers as the same system id. | pymavlink |
+| `sitl.sh` | Launches ArduPilot SITL from a version-matched source tree: one git worktree per release beside the main checkout (`ap-Copter-4.7.1`, `ap-plane-<hash>`), chosen by version or hash, the vehicle's own tree first when there is one; prints the tree, version and hash on launch so you know what you are flying. | bash, an ArduPilot checkout with its worktrees, MAVProxy |
+| `sitl-flight-test.py` | Smoke-tests a running SITL by flying it, not by checking that a binary exists: copter GUIDED, arm, take off, land (FAIL if still airborne at the timeout); plane TAKEOFF, arm, verify the climb, RTL. Refuses to arm anything that is not SITL (no `SIM_SPEEDUP` parameter). | pymavlink |
+| `mavftp-put.py` | Uploads a file to a flight controller over MAVFTP and verifies it against the board's own CRC, pinned to one board by its USB serial, firmware hash and board id like `ap-param-apply.py`, refusing while armed. pymavlink's `cmd_put` returns before any data is sent, so a bare put can leave an empty or corrupted file and report nothing; this pumps the transfer to completion, verifies, and retries. `--selftest` covers the CRC, the identity and armed decisions and the retry logic offline. | pymavlink |
+| `ap-mag-cal.py` | ArduPilot's onboard compass calibration driven over MAVLink, pinned to one board by its USB serial, firmware hash and board id like `ap-param-apply.py`: `start` runs it with the offsets not autosaved and prints the full report, `accept` saves them and reads the offsets back per compass, `cancel` discards the fit. `start` and `accept` refuse while the vehicle is armed. `start` itself saves `COMPASS_LEARN=0` and latches a reboot requirement; the tool says so. | pymavlink |
+| `ap-heading-watch.py` | Read-only, once a second: the EKF's yaw beside the compass heading computed from the raw field, the field strength, the EKF flags and compass variance, the GPS fix and satellite count (never a position); optional CSV and a gyro-only yaw for a box that stands still. `--selftest` checks the heading arithmetic. | pymavlink (not for `--selftest`) |
+| `sitl-qhover-steps.py` | Flies an already-running SITL quadplane or copter tailsitter a hover-only step profile (climb, hands-off hold, yaw steps, roll and pitch steps, land) and writes each phase's start and end in vehicle time, so a log can be cut by phase. Refuses to arm anything that is not SITL, and to fly if the parameters you name are not on the vehicle; fails if the climb does not reach its target. | pymavlink |
+| `vtol-yaw-metrics.py` | Yaw-authority metrics off a hover log: does the yaw rate follow its demand, how far does heading drift hands-off, how hard is the yaw controller working, are the motors saturating, and what the CW-minus-CCW motor split answers to (yaw, roll or pitch demand), with the motors named by number as the props are built. `--selftest` runs on synthetic rows. | pymavlink, numpy |
 | `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. | `pyserial` |
 | `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing`, `invalid` or `unchecked`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
 
-Without `--device` or `--port`, `ap-ftp-get.py`, `ap-param-dump.py` and
-`bf-cli.py` look in `/dev/serial/by-id` (Linux only); the last two then fall
-back to `/dev/ttyACM0`. `ap-param-apply.py` always takes the device.
-Elsewhere, name the port.
+Without `--device` or `--port`, `ap-ftp-get.py`, `ap-param-dump.py`,
+`mavftp-put.py` and `bf-cli.py` look in `/dev/serial/by-id` (Linux only);
+the last three then fall back to `/dev/ttyACM0`. `ap-param-apply.py` and
+`ap-mag-cal.py` always take the device. Elsewhere, name the port.
 
 `--help` gives each tool's options and a one-paragraph summary; the
 script's docstring says what it does and why in more detail.
@@ -242,6 +252,138 @@ write is a race: on the 150 ms link the tool stops partway and says how
 far it got; on loopback the loop can finish first, and the check asserts
 that the tool then exits 1 with a warning, not how many writes landed
 armed.
+
+## SITL: sitl.sh, sitl-flight-test.py, ap-version.py
+
+    AP_TREES=/path/to/trees ./sitl.sh 4.7.1 ArduCopter --no-mavproxy   # Copter 4.7.1
+    ./sitl.sh 4.7.1 ArduPlane --no-mavproxy                             # Plane: ap-Plane-4.7.1 if it exists, else the Copter tree
+    ./sitl.sh dbe79216 ArduCopter --no-mavproxy                         # a commit
+    python3 sitl-flight-test.py [--vehicle copter|plane] [--device tcp:127.0.0.1:5760]
+    python3 ap-version.py [tcp:127.0.0.1:5760 | udp:0.0.0.0:14550 | /dev/ttyACM0 --baud 115200]
+
+`sitl.sh` expects one git worktree per version beside the main ArduPilot
+checkout, named `ap-<Vehicle>-<version>` or `ap-<vehicle>-<hash>`, under
+`AP_TREES` (default: the directory the script is in). ArduPilot tags Copter
+and Plane releases on one commit when they ship together, so one worktree
+built with both `./waf copter` and `./waf plane` serves both vehicles; do not
+add a second worktree for the same commit. Everything after the vehicle
+passes through to `sim_vehicle.py`. `AP_VENV` names a venv with MAVProxy
+and pymavlink to put first on `PATH`. Never pass `--map` or `--console` on a
+headless machine. SITL's first serial port takes one TCP client, and
+`sim_vehicle.py` gives it to MAVProxy unless you pass `--no-mavproxy`: with
+MAVProxy running, point the tools at `tcp:127.0.0.1:5762` instead.
+`sitl-flight-test.py` arms and takes off, so it reads `SIM_SPEEDUP` back
+first and refuses, exit 2, when the parameter is absent: a real vehicle
+has none. No heartbeat is a failure at once. `ap-version.py` reads
+`AUTOPILOT_VERSION` and prints the version, the git hash, the board id (as
+the other tools' `--expect-board` takes it), the uid, and the
+`git worktree add` line that pins a tree to that hash.
+
+## mavftp-put.py
+
+    python3 mavftp-put.py LOCAL /APM/scripts/script.lua --expect-uid <24 hex> --expect-git <hash> --expect-board <id> [--device DEV] [--mkdir] [--retries N]
+    python3 mavftp-put.py LOCAL REMOTE --verify-only
+    python3 mavftp-put.py --selftest
+
+pymavlink's `MAVFTP.cmd_put` returns as soon as it has sent `CreateFile`,
+before any data block is pumped, so a bare put silently writes an empty
+file, and a directory listing interleaved with the writes corrupts the
+first bytes; both were seen on hardware, with no error reported. This tool
+pumps the transfer to completion, then asks the board for its CRC
+(`CalcFileCRC32`, ArduPilot's reflected 0xEDB88320 with init 0, which is not
+zlib's) and compares; a mismatch, an empty result or a missing CRC reply is
+retried up to `--retries` times, and the exit is 0 only on VERIFIED. This
+writes to a flight controller: the system and component id are pinned from
+the first autopilot heartbeat, the three `--expect-*` values (from
+`ap-version.py`) must all match or nothing is sent, a second board at the
+same system id is a refusal, and an armed vehicle, or no heartbeat in 3 s,
+refuses before `--mkdir` and before every attempt. Each attempt removes
+the remote file first, so a failed upload leaves the board without it; the
+failure message says so. `--verify-only` needs none of the `--expect-*`
+values. The default device is the first ArduPilot USB serial device, else
+`/dev/ttyACM0`. The selftest checks the CRC vector, the identity and armed
+decisions, and the retry and verify logic against a fake board.
+
+## ap-mag-cal.py
+
+    python3 ap-mag-cal.py start  DEV --expect-uid <24 hex> --expect-git <hash> --expect-board <id> [--timeout 300] [--log cal.txt]
+    python3 ap-mag-cal.py accept DEV --expect-uid ... --expect-git ... --expect-board ...
+    python3 ap-mag-cal.py cancel DEV --expect-uid ... --expect-git ... --expect-board ...
+    python3 ap-mag-cal.py --selftest
+
+This writes to a flight controller. `start` sends `MAV_CMD_DO_START_MAG_CAL`
+for every compass in use (mask 0: the board skips an unhealthy compass and
+one with `COMPASS_USEn=0`, and refuses outright under `COMPASS_LEARN=2`),
+prints the mask it started, the progress and then the report in full
+(fitness, offsets, diagonals, off-diagonals, scale, the orientation check
+with its confidence), and cancels on `--timeout`. The fit the board
+accepts is `COMPASS_CAL_FIT` for an external first compass and twice that
+for the others. Two things `start` changes at once, whatever happens
+after: the board saves `COMPASS_LEARN=0` (printed before and after; `cancel`
+does not put it back) and, on the first start since boot, refuses to arm
+until it reboots ("Compass calibrated requires reboot"). The calibrated
+offsets are not saved until `accept` sends `MAV_CMD_DO_ACCEPT_MAG_CAL`; a
+poor report is thrown away with `cancel`. The board's ACK to `accept` is
+not the truth (it says accepted when nothing was started, and failed when
+one compass was saved and another was not), so the tool reads
+`COMPASS_OFS*` back for each compass and exits 0 only when at least one
+changed, naming which. The progress and report messages are sent only on
+request: the tool asks for them with `SET_MESSAGE_INTERVAL` before `start`
+(reset when it ends), falls back to the EXTRA3 stream rate if the board
+refuses, and refuses to start if neither is accepted. Identity is checked
+as `ap-param-apply.py` does: the three `--expect-*` values must all match
+the board or nothing is sent, and a second board answering at the same
+system id is a refusal (a board answering after the 3 s window, or two
+boards with the same uid, is not caught). `start` and `accept` refuse while
+the vehicle is armed, judged from a fresh heartbeat just before the command
+and watched during the ACK wait and any re-send; no heartbeat in 3 s is
+also a refusal. `cancel` is allowed while armed. `--log` receives
+everything printed, refusals included. The selftest covers the report
+formatting, the message request and its fallback, the per-compass
+readback verdict, and the armed check against a fake link.
+
+## ap-heading-watch.py
+
+    python3 ap-heading-watch.py DEV [--secs N] [--csv FILE] [--gyro-from DEG]
+    python3 ap-heading-watch.py --selftest
+
+Read-only. Each line: the EKF yaw (`ATTITUDE`), the compass heading
+computed here from the primary compass's field (`RAW_IMU`, tilt-compensated
+with the attitude and corrected by the board's live `COMPASS_DEC`, the same
+arithmetic as `Compass::calculate_heading()`), their difference, the field
+strength, roll and pitch, declination, the EKF flags and compass variance,
+the GPS fix type and satellite count (never a position), the `ATTITUDE`
+rate and the compass health. The compass heading moves as soon as the field
+does, where the EKF's yaw is filtered, so the pair shows a compass problem
+before the EKF reports one. The board must stream `ATTITUDE` and `RAW_IMU`
+on the link; a fresh SITL streams nothing until asked. The selftest checks
+the heading arithmetic against hand-computed cases and an independent
+rotation matrix.
+
+## Yaw authority: sitl-qhover-steps.py and vtol-yaw-metrics.py
+
+    python3 sitl-qhover-steps.py [--device tcp:127.0.0.1:5760] --check-params airframe.parm --phases-out phases.json [--alt 10] [--hold-s 20]
+    python3 vtol-yaw-metrics.py LOG.bin --cw 2,3 --ccw 1,4 [--phases phases.json] [--json out.json]
+    python3 vtol-yaw-metrics.py --selftest
+
+The question: can the rate controller follow a yaw step and hold heading
+hands-off, and what does the motor split answer to. The profile flies an
+already-running SITL quadplane or copter tailsitter in QHOVER only (no
+transitions, no mission): arm on the ground, climb to `--alt`, hands-off
+hold, yaw stick steps each way, then roll and pitch steps, each followed by
+centred sticks, then land. It refuses to arm anything without a
+`SIM_SPEEDUP` parameter, refuses to fly if any parameter in
+`--check-params` is missing or differs on the vehicle, lands and fails if
+the climb does not reach `--alt` in time, and writes each phase's start
+and end in the vehicle's own boot time. The metrics tool
+reads the dataflash log, cuts it by those phases (or `--window`), and
+reports the yaw-rate tracking per step, the hands-off heading drift, the
+yaw controller's effort, motor saturation, and a regression of the
+CW-minus-CCW motor split (motors named by number as the props are built,
+`Motor1` = `SERVOn_FUNCTION` 33) against the roll, pitch and yaw outputs: a
+split that loads on the yaw output means differential torque is the yaw
+actuator; one that loads on roll means a roll demand also moves the
+yaw-axis split. Positions are never read. Needs numpy.
 
 ## bf-cli.py
 
