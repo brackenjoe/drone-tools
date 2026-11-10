@@ -314,7 +314,8 @@ decisions, and the retry and verify logic against a fake board.
 This writes to a flight controller. `start` sends `MAV_CMD_DO_START_MAG_CAL`
 for every compass in use (mask 0: the board skips an unhealthy compass and
 one with `COMPASS_USEn=0`, and refuses outright under `COMPASS_LEARN=2`),
-prints the mask it started, the progress and then the report in full
+prints the mask it started, every compass's progress on one line at most every
+2 s while progress arrives (a finished compass by its report's status), and then the report in full
 (fitness, offsets, diagonals, off-diagonals, scale, the orientation check
 with its confidence), and cancels on `--timeout`. The fit the board
 accepts is `COMPASS_CAL_FIT` for an external first compass and twice that
@@ -339,7 +340,7 @@ the vehicle is armed, judged from a fresh heartbeat just before the command
 and watched during the ACK wait and any re-send; no heartbeat in 3 s is
 also a refusal. `cancel` is allowed while armed. `--log` receives
 everything printed, refusals included. The selftest covers the report
-formatting, the message request and its fallback, the per-compass
+formatting, the progress line, the message request and its fallback, the per-compass
 readback verdict, and the armed check against a fake link.
 
 ## ap-heading-watch.py

@@ -290,6 +290,32 @@ def all_reports_in(cal_mask, reports):
     return all((cal_mask >> i) & 1 == 0 or i in reports for i in range(8))
 
 
+def format_progress(cal_mask, progress, reports):
+    """One line with every compass: its latest progress, or its report once done.
+
+    The FC sends MAG_CAL_PROGRESS only for compasses still running, one message
+    each per call, starting after the last one sent (ArduPilot 4.7.1
+    AP_Compass_Calibration.cpp:244-281), and none for a finished compass, so a
+    finished compass is shown by its report. `progress` and `reports` map
+    compass_id to the latest message; compasses are the mask bits plus any
+    that sent either."""
+    ids = sorted({i for i in range(8) if (cal_mask >> i) & 1} | set(progress) | set(reports))
+    if not ids:
+        return "progress: no compass"
+    parts = []
+    for i in ids:
+        if i in reports:
+            s = reports[i].cal_status
+            parts.append(f"compass {i}: reported {STATUS.get(s, s)}")
+        elif i in progress:
+            p = progress[i]
+            parts.append(f"compass {i}: {STATUS.get(p.cal_status, p.cal_status)} "
+                         f"attempt {p.attempt} {p.completion_pct}%")
+        else:
+            parts.append(f"compass {i}: no progress yet")
+    return "progress: " + " | ".join(parts)
+
+
 def selftest():
     """Offline checks of the pure parts; no flight controller, no link."""
     from types import SimpleNamespace as NS
@@ -322,6 +348,27 @@ def selftest():
     check("report mask: compass 2 still missing", not all_reports_in(0b101, {0: rep}))
     check("report mask: both in", all_reports_in(0b101, {0: rep, 2: rep}))
     check("report mask: empty mask", all_reports_in(0, {}))
+
+    def prog(status, attempt, pct):
+        return NS(cal_status=status, attempt=attempt, completion_pct=pct)
+
+    three = {0: prog(2, 1, 34), 1: prog(2, 1, 50), 2: prog(3, 2, 7)}
+    check("progress: all three in order",
+          format_progress(0b111, three, {}) == "progress: compass 0: RUNNING_STEP_ONE attempt 1 34% | "
+          "compass 1: RUNNING_STEP_ONE attempt 1 50% | compass 2: RUNNING_STEP_TWO attempt 2 7%")
+    check("progress: silent compasses say so",
+          format_progress(0b111, {0: prog(2, 1, 34)}, {}) == "progress: compass 0: RUNNING_STEP_ONE "
+          "attempt 1 34% | compass 1: no progress yet | compass 2: no progress yet")
+    check("progress: a report wins over stale progress",
+          format_progress(0b11, {0: prog(2, 1, 34), 1: prog(2, 1, 90)}, {1: NS(cal_status=4)})
+          == "progress: compass 0: RUNNING_STEP_ONE attempt 1 34% | compass 1: reported SUCCESS")
+    check("progress: unknown status printed as its number",
+          format_progress(0b1, {0: prog(99, 1, 5)}, {}) == "progress: compass 0: 99 attempt 1 5%")
+    check("progress: compass outside the mask still listed",
+          format_progress(0b1, {0: prog(2, 1, 5), 2: prog(2, 1, 6)}, {})
+          == "progress: compass 0: RUNNING_STEP_ONE attempt 1 5% | "
+          "compass 2: RUNNING_STEP_ONE attempt 1 6%")
+    check("progress: no compass", format_progress(0, {}, {}) == "progress: no compass")
 
     def hb(armed, src=(1, 1)):
         h = NS(base_mode=(armed_bit if armed else 0) | 1)
@@ -491,7 +538,8 @@ def main():
     ap.add_argument('--log', help='append everything printed to this file, the REFUSED/STOPPED '
                                   'messages and the exit code too (not argument errors)')
     ap.add_argument('--selftest', action='store_true',
-                    help='run the offline checks of the report formatting, the armed check, the '
+                    help='run the offline checks of the report formatting, the progress line, '
+                         'the armed check, the '
                          'message request and the accept verdict, then exit; needs pymavlink, '
                          'no flight controller')
     a = ap.parse_args()
@@ -627,12 +675,15 @@ def watch(m, sysid, compid, timeout, say, command):
     """Print progress and reports until every started compass has reported or
     `timeout` s pass (then cancel). Exit code of the run."""
     t0, last_print, reports, mask_said = time.time(), 0.0, {}, False
+    progress, mask = {}, 0
     while time.time() - t0 < timeout:
         msg = recv_from(m, ['MAG_CAL_PROGRESS', 'MAG_CAL_REPORT', 'STATUSTEXT'],
                         sysid, compid, 1)
         if msg is None:
             continue
         t = msg.get_type()
+        if t != 'STATUSTEXT':
+            mask = msg.cal_mask
         if t != 'STATUSTEXT' and not mask_said:
             mask_said = True
             on = [i for i in range(8) if (msg.cal_mask >> i) & 1]
@@ -641,10 +692,10 @@ def watch(m, sysid, compid, timeout, say, command):
         if t == 'STATUSTEXT':
             say(f"FC: {msg.text}")
         elif t == 'MAG_CAL_PROGRESS':
+            progress[msg.compass_id] = msg
             if time.time() - last_print >= 2:
                 last_print = time.time()
-                say(f"compass {msg.compass_id}: {STATUS.get(msg.cal_status, msg.cal_status)} "
-                    f"attempt {msg.attempt} {msg.completion_pct}%")
+                say(format_progress(mask, progress, reports))
         elif t == 'MAG_CAL_REPORT' and msg.compass_id not in reports:
             reports[msg.compass_id] = msg
             for line in format_report(msg):
