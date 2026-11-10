@@ -5,16 +5,17 @@
 # simulator: Betaflight SITL serves the CLI on TCP 5761 by itself, UART1). Its
 # eeprom.bin lands in a scratch dir under /tmp, never in the repo.
 #
-# Needs: bash (uses /dev/tcp), python3 with pyserial, setsid, pgrep.
+# Needs: bash (uses /dev/tcp), python3 with pyserial, setsid, pgrep, sha256sum.
 # Optional: shellcheck (without it that check prints SKIP and is not counted).
 # TCP 5761 must be free; if something else holds it the script exits 2.
 #
 # Build the SITL once:  clone Betaflight at tag 2026.6.2, then `make TARGET=SITL`.
 # Run:                  BF_SITL=/path/to/betaflight_SITL.elf bf-cli-sitl-check.sh
 #                       (BF_SITL unset: ./betaflight/obj/main/betaflight_SITL.elf beside this script)
-# 92 checks (91 when shellcheck is not installed: that one is skipped, not
-# counted). Exit status is the number of failed checks (0 = all passed), or 2
-# if SITL could not be started. The SITL this script started is killed on exit.
+# 190 checks (189 when shellcheck is not installed: that one is skipped, not
+# counted), 83 of them for the refusals and the restore allowlist (section
+# 9g). Exit status is the number of failed checks (0 = all passed), or 2 if
+# SITL could not be started. The SITL this script started is killed on exit.
 set -u
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -435,6 +436,251 @@ pass=$((pass + $(grep -c '^PASS ' <<<"$out")))
 fail=$((fail + $(grep -c '^FAIL ' <<<"$out")))
 grep -q Traceback <<<"$out" && bad "9e offline old-firmware test crashed" "$out"
 [ "$(grep -c '^PASS ' <<<"$out")" -ge 20 ] || bad "9e offline old-firmware test ran fewer than 20 checks" "$out"
+
+# 9f msp: read-only over MSP, no CLI, no reboot. SITL answers MSP on the same UART1 port.
+start_sitl
+pid_before=$(pgrep -f "$sitl" | tr '\n' ' ')
+run_expect "msp exits 0" 0 bf msp --samples 3 --interval 0.1
+has "msp prints the firmware version" "fc: BTFL $want_version"
+has "msp prints the MSP API version" "MSP API 1\\.[0-9]"
+has "msp prints sample lines with rssi and rc" "sample 3/3: arming disabled: .* | rssi [0-9]*/1023 ([0-9]*%) | rc"
+has "msp prints the summary" "summary over 3 samples:"
+# the 30-entry table: SITL has no receiver, so RXLOSS (bit 2) is set; a table that was not
+# chosen by the count byte would print "bit 2"
+has "msp decodes flag names from the 30-entry table" "arming disabled: .*RXLOSS"
+if grep -q 'bit [0-9]' <<<"$out"; then bad "msp printed a bit N flag on the 30-entry table" "$out"; else ok "msp prints no bit N flag names"; fi
+if grep -E '^sample' <<<"$out" | grep -qw CLI; then bad "msp output has a CLI flag" "$out"; else ok "msp output has no CLI arming-disable flag"; fi
+pid_after=$(pgrep -f "$sitl" | tr '\n' ' ')
+[ -n "$pid_before" ] && [ "$pid_before" = "$pid_after" ] && ok "SITL pid unchanged by msp ($pid_after)" || bad "SITL pid changed or gone across msp: '$pid_before' -> '$pid_after'"
+run_expect "identify after msp still works" 0 bf identify
+has "identify after msp reads the version" "firmware: Betaflight $want_version"
+# a board left in CLI mode ignores MSP: exit 2, and msp must not have sent `exit` or anything
+# that leaves CLI mode (a bare newline still gets the prompt afterwards)
+start_sitl
+python3 - <<'PYEOF' || bad "9f could not leave SITL in CLI mode"
+import socket, time
+s = socket.create_connection(('127.0.0.1', 5761)); s.settimeout(2)
+s.send(b'#'); time.sleep(0.8)
+assert s.recv(4096).endswith(b'\r\n# ')
+s.close()
+PYEOF
+run_expect "msp on a board left in CLI mode" 2 bf msp
+has "msp on a CLI-mode board says it may be in CLI mode" "may be in CLI mode"
+has "msp on a CLI-mode board says it does not send exit" "does not send .exit."
+if python3 - <<'PYEOF'
+import socket, time
+s = socket.create_connection(('127.0.0.1', 5761)); s.settimeout(2)
+s.send(b'\r\n'); time.sleep(0.8)
+r = s.recv(4096)
+assert r.endswith(b'# '), r
+PYEOF
+then ok "board still in CLI mode after msp (newline gets the prompt)"; else bad "board left CLI mode, or gave no prompt, after msp"; fi
+start_sitl
+
+# 9g refusals and the restore allowlist. The case labels are only names: U and X are `run` cases
+# (a line the CLI would edit, a line that would exit or complete), R the same lines in a `restore` file.
+# Every refusal case asserts three things: exit 1, the refusal's key phrase, and the SITL's eeprom.bin
+# sha256 identical before and after. "pre" cases also assert the tool never connected: SITL still
+# answers on 5761 afterwards (a session that connects ends with `exit`, which makes SITL quit).
+eeprom_hash() { sha256sum "$work/eeprom.bin" 2>/dev/null | cut -c1-64; }
+# refused NAME PHRASE KIND CMD... ; KIND: pre (refused before connecting, "Nothing was sent"),
+# pre-msp (same, for a refusal whose message lacks "Nothing was sent": msp, an empty restore file), conn (connects to read the identity, then refuses)
+refused() {
+    local name=$1 phrase=$2 kind=$3 h0 h1 problems=
+    shift 3
+    h0=$(eeprom_hash)
+    out=$("$@" 2>&1)
+    rc=$?
+    h1=$(eeprom_hash)
+    [ "$rc" -eq 1 ] || problems+="exit $rc, wanted 1; "
+    grep -qF -- "$phrase" <<<"$out" || problems+="no '$phrase'; "
+    { [ -n "$h0" ] && [ "$h0" = "$h1" ]; } || problems+="EEPROM '$h0' -> '$h1'; "
+    case $kind in
+        pre | pre-msp)
+            if [ "$kind" = pre ]; then grep -qF 'Nothing was sent' <<<"$out" || problems+="no 'Nothing was sent'; "; fi
+            if grep -q '^port:' <<<"$out"; then problems+="connected; "; fi
+            { kill -0 "$sitl_pid" 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/5761) 2>/dev/null; } \
+                || problems+="SITL gone (the tool connected and sent exit); " ;;
+    esac
+    if [ -z "$problems" ]; then ok "refused: $name"; else bad "refused: $name: $problems" "$out"; fi
+    if [ "$kind" = conn ]; then start_sitl; fi
+    return 0
+}
+# probe NAME LINE... : a copy of the real backup with the LINEs appended, path in $probe
+probe() {
+    probe="$work/probe_$1.diff"
+    cp "$good" "$probe"
+    shift
+    printf '%s\n' "$@" >>"$probe"
+}
+rs() { bf restore "$1" --expect-board SITL --expect-version "$want_version"; }  # without --save
+start_sitl
+
+# run: every FORBIDDEN word, refused before connecting
+for c in save defaults bl dfu exit flash_erase msc motor escprog serialpassthrough gpspassthrough; do
+    refused "run $c" 'is not sent by run' pre bf run "set craft_name = NEVER" "$c"
+done
+refused "run SAVE (upper case)" 'is not sent by run' pre bf run "SAVE"
+refused "run ' save' (leading space)" 'is not sent by run' pre bf run " save"
+refused "run 'save noreboot'" 'is not sent by run' pre bf run "save noreboot"
+refused "run 'defaults nosave'" 'is not sent by run' pre bf run "defaults nosave"
+refused "run forbidden word with --save" 'is not sent by run' pre bf run "set craft_name = NEVER" bl --save
+
+# run: a line the CLI editor would run as something else (U and X cases of the gate README)
+refused 'run U3 sa\x01ve' 'control character (\x01)' pre bf run "set craft_name = NEVER" $'sa\x01ve'
+refused 'run U5 savex\x7f' 'DEL at position' pre bf run "set craft_name = NEVER" $'savex\x7f'
+refused 'run U6 sa\x1fve' 'control character (\x1f)' pre bf run "set craft_name = NEVER" $'sa\x1fve'
+refused 'run U8 sa?' "'?' at position" pre bf run "set craft_name = NEVER" 'sa?'
+refused 'run U9 sa<tab>' 'tab at position' pre bf run "set craft_name = NEVER" $'sa\t'
+refused 'run X4 \x04' 'exits the CLI' pre bf run "set craft_name = NEVER" $'\x04'
+refused 'run X7 b\x01l' 'control character (\x01)' pre bf run $'b\x01l'
+refused 'run \x0c' 'clears the screen' pre bf run $'set craft_name = N\x0c'
+refused 'run line break inside an argument' 'line break (\x0a)' pre bf run $'set craft_name = NEVER\nsave'
+refused 'run CR inside an argument' 'line break (\x0d)' pre bf run $'set craft_name = NEVER\rsave'
+refused 'run # comment cut' "'#' at position" pre bf run "set craft_name = a#b"
+refused 'run non-ASCII' 'non-ASCII character' pre bf run $'set craft_name = caf\xc3\xa9'
+
+# restore: the same bytes inside a file, refused before connecting
+probe R1 "set craft_name = NEVER" $'sa\x01ve'
+refused 'restore R1 sa\x01ve' 'control character (\x01)' pre rs "$probe"
+probe R2 "set craft_name = NEVER" $'savex\x7f'
+refused 'restore R2 savex\x7f' 'DEL at position' pre rs "$probe"
+probe R6 "set craft_name = NEVER" $'sa\x1fve'
+refused 'restore R6 sa\x1fve' 'control character (\x1f)' pre rs "$probe"
+probe R7 "set craft_name = NEVER" $'sa\x1cve'
+refused 'restore sa\x1cve' 'Nothing was sent' pre rs "$probe"
+probe R8 "set craft_name = NEVER" 'sa?'
+refused 'restore sa?' "'?' at position" pre rs "$probe"
+probe R9 "set craft_name = NEVER" $'sa\t'
+refused 'restore sa<tab>' 'tab at position' pre rs "$probe"
+probe R10 $'\x04'
+refused 'restore \x04' 'exits the CLI' pre rs "$probe"
+probe R11 "set craft_name = a#b"
+refused 'restore # comment cut' "'#' at position" pre rs "$probe"
+probe R12 $'set craft_name = caf\xc3\xa9'
+refused 'restore non-ASCII' 'non-ASCII character' pre rs "$probe"
+
+# restore: forbidden first words, defaults and save variants, words a diff all never holds
+for c in bl dfu exit flash_erase msc 'motor 1 1000' escprog serialpassthrough gpspassthrough; do
+    probe F "set craft_name = NEVER" "$c"
+    refused "restore file with '$c'" 'which restore will not send' pre rs "$probe"
+done
+probe F "set craft_name = NEVER" "defaults"
+refused "restore file with plain 'defaults'" 'not the plain `defaults nosave`' pre rs "$probe"
+probe F "set craft_name = NEVER" "defaults all"
+refused "restore file with 'defaults all'" 'not the plain `defaults nosave`' pre rs "$probe"
+probe F "set craft_name = NEVER" "save noreboot"
+refused "restore file with 'save noreboot'" 'file contains `save noreboot`' pre rs "$probe"
+for c in 'get craft_name' status 'dump all' 'diff all' tasks resources; do
+    probe F "set craft_name = NEVER" "$c"
+    refused "restore file with '$c'" 'is not a command a `diff all`' pre rs "$probe"
+done
+grep -E '^#|^$' "$good" >"$work/nolines.diff"
+# (this one's message has no "Nothing was sent")
+refused "restore file with no configuration lines" 'holds no configuration lines' pre-msp rs "$work/nolines.diff"
+
+# restore: the pin on the file header (refused before connecting)
+body "$good" >"$work/nohdr.diff"
+refused "restore file without a bf-cli.py header" 'has no bf-cli.py header' pre rs "$work/nohdr.diff"
+refused "restore wrong --expect-board" '!= --expect-board' pre \
+    bf restore "$good" --expect-board NOPE --expect-version "$want_version"
+refused "restore wrong --expect-version" '!= --expect-version' pre \
+    bf restore "$good" --expect-board SITL --expect-version 2025.12.0
+sed "s|^\(# Betaflight / SITL (SITL)\) $want_version|\1 2025.12.0|" "$good" >"$work/embver.diff"
+refused "restore file whose own version line disagrees with its header" "file's own version line" pre rs "$work/embver.diff"
+# restore: file and expectations agree, the flight controller does not (connects to read the identity)
+sed -e 's|^# board: SITL|# board: FOO|' -e 's|^\(# Betaflight / \)SITL (SITL)|\1FOO (FOO)|' "$good" >"$work/wrongfc.diff"
+refused "restore for another board than the FC" 'REFUSED, wrong flight controller' conn \
+    bf restore "$work/wrongfc.diff" --expect-board FOO --expect-version "$want_version" --save
+has "wrong-board restore says nothing was written" "Nothing was written"
+sed -e "s|^# firmware: $want_version|# firmware: 2025.12.0|" -e "s|^\(# Betaflight / SITL (SITL)\) $want_version|\1 2025.12.0|" "$good" >"$work/wrongfw.diff"
+refused "restore for other firmware than the FC runs" 'REFUSED, wrong flight controller' conn \
+    bf restore "$work/wrongfw.diff" --expect-board SITL --expect-version 2025.12.0 --save
+
+# msp: refusals before connecting, and the read-only allowlist at the one place that writes
+refused "msp --samples 0" '--samples must be at least 1' pre-msp bf msp --samples 0
+refused "msp --interval -1" '--interval at least 0' pre-msp bf msp --interval=-1
+out=$(BF_TOOL="$tool" python3 - <<'PYEOF' 2>&1
+import importlib.util, os
+sp = importlib.util.spec_from_file_location('bfcli', os.environ['BF_TOOL'])
+m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+class W:
+    def __init__(self): self.sent = []
+    def write(self, b): self.sent.append(b)
+def chk(name, cond): print(('PASS ' if cond else 'FAIL ') + name)
+for cid, nm in ((68, 'MSP_REBOOT'), (200, 'MSP_SET_RAW_RC'), (202, 'MSP_SET_PID'), (250, 'MSP_EEPROM_WRITE'), (0, 'id 0')):
+    w = W()
+    try: m.msp_send(w, cid); ok = False
+    except m.Refused as e: ok = 'read-only allowlist' in str(e) and not w.sent
+    chk(f'msp_send refuses {nm} ({cid}) and writes nothing', ok)
+w = W(); m.msp_send(w, 1)
+chk('msp_send sends an allowlisted id (1)', len(w.sent) == 1)
+PYEOF
+)
+echo "$out"
+pass=$((pass + $(grep -c '^PASS ' <<<"$out")))
+fail=$((fail + $(grep -c '^FAIL ' <<<"$out")))
+grep -q Traceback <<<"$out" && bad "9g msp allowlist test crashed" "$out"
+
+# restore allowlist, positive: a real `diff all` body from SITL passes the line check, and so does
+# `mixer HEX6X` (`mixer` is on the restore allowlist; 2026.6.2's diff all prints it for a non-QUADX craft)
+start_sitl
+mkdir "$work/p1"
+real=$(snapshot "$work/p1")
+if [ -s "$real" ]; then ok "a fresh diff all taken from SITL for the allowlist check"; else bad "no fresh diff all from SITL"; fi
+before=$(eeprom_hash)
+out=$(bf run 'mixer HEX6X' 'diff all' 2>&1)
+has "SITL's own diff all prints mixer HEX6X for a HEX6X craft" '^mixer HEX6X'
+if [ "$before" = "$(eeprom_hash)" ]; then ok "mixer HEX6X unsaved: EEPROM unchanged"; else bad "EEPROM changed by an unsaved mixer HEX6X"; fi
+printf '%s\n' "$out" >"$work/hexrun.txt"
+cp "$real" "$work/mixer.diff"
+printf '%s\n' 'mixer HEX6X' >>"$work/mixer.diff"
+out=$(BF_TOOL="$tool" BF_REAL="$real" BF_HEX="$work/hexrun.txt" BF_MIXER="$work/mixer.diff" python3 - <<'PYEOF' 2>&1
+import importlib.util, os
+sp = importlib.util.spec_from_file_location('bfcli', os.environ['BF_TOOL'])
+m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+def chk(name, cond, d=''): print(('PASS ' if cond else 'FAIL ') + name + ('' if cond else f'  [{d}]'))
+def line_check(path):
+    hdr, emb, lines = m.read_file_header(path)
+    return m.restore_lines(lines), lines
+try:
+    (send, skipped), lines = line_check(os.environ['BF_REAL'])
+    chk('real diff all from SITL passes the line check', len(send) > 5, len(send))
+    alone = []
+    for ln in lines:
+        try: m.restore_lines([ln])
+        except m.Refused as e: alone.append((ln, str(e)))
+    chk('and no single line of it is refused', not alone, alone[:2])
+    chk('it skips defaults nosave, save and batch (not sent)', len(skipped) >= 3, skipped)
+except m.Refused as e:
+    chk('real diff all from SITL passes the line check', False, e)
+try:
+    (send, skipped), lines = line_check(os.environ['BF_MIXER'])
+    chk('real diff all plus mixer HEX6X passes the line check', 'mixer HEX6X' in send, send[-3:])
+except m.Refused as e:
+    chk('real diff all plus mixer HEX6X passes the line check', False, e)
+# the lines of SITL's own HEX6X diff all, as the run printed them
+txt = open(os.environ['BF_HEX']).read().split('> diff all', 1)[1].split('\nnot saved:', 1)[0]
+body = [l for l in txt.split('\n') if l.strip()]
+try:
+    send, skipped = m.restore_lines(body)
+    chk('the HEX6X diff all body as printed passes the line check, mixer line included', 'mixer HEX6X' in send, send[:3])
+except m.Refused as e:
+    chk('the HEX6X diff all body as printed passes the line check, mixer line included', False, e)
+try: m.restore_lines(['mixers HEX6X']); chk('"mixers HEX6X" is still refused', False)
+except m.Refused: chk('"mixers HEX6X" is still refused', True)
+PYEOF
+)
+echo "$out"
+pass=$((pass + $(grep -c '^PASS ' <<<"$out")))
+fail=$((fail + $(grep -c '^FAIL ' <<<"$out")))
+grep -q Traceback <<<"$out" && bad "9g allowlist test crashed" "$out"
+start_sitl
+before=$(eeprom_hash)
+run_expect "restore of a diff holding mixer HEX6X is accepted (validate only)" 0 rs "$work/mixer.diff"
+has "mixer HEX6X restore validated, nothing saved" "validated, nothing saved"
+if [ "$before" = "$(eeprom_hash)" ]; then ok "mixer restore without --save: EEPROM unchanged"; else bad "EEPROM changed by a validate-only mixer restore"; fi
+start_sitl
 
 # 10 static checks
 python3 -m py_compile "$tool" && ok "py_compile" || bad "py_compile"

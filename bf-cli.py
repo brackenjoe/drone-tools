@@ -22,6 +22,11 @@ line, stops on the CLI's error marker, and never saves unless asked to.
              `get NAME` and must hold V; saving only with --save
   restore    put a backup file back, refusing unless the FC's board and
              firmware version equal both --expect-* and the file's own header
+  msp        read-only over MSP, never the CLI, never a reboot: why the board
+             will not arm. Prints FC variant, version, board and craft name, the
+             mode ranges, then --samples (default 10) lines --interval seconds
+             (default 0.2) apart with the arming-disable flags, RSSI and RC
+             channels, a summary, and which modes the last RC frame puts on
 
 Save rules (Betaflight 2026.6.2, src/main/cli/cli.c):
   `exit`           leaves WITHOUT saving and reboots, discarding RAM changes
@@ -50,12 +55,26 @@ Usage:
   bf-cli.py --port /dev/ttyACM0 backup -o ~/backups --dump
   bf-cli.py --port socket://127.0.0.1:5761 run "get craft_name"
   bf-cli.py run "set craft_name = MYQUAD" --save
+  bf-cli.py --port socket://127.0.0.1:5761 msp --samples 5 --interval 0.5
   bf-cli.py restore ~/backups/MYQUAD_2026.6.2_20261018T120000Z.diff \\
       --expect-board STM32H743 --expect-version 2026.6.2 --save
 
 Exit codes: 0 ok; 1 refused, read-back or verify mismatch, CLI error, or a
 backup written with firmware warnings; 2 could not connect, link lost, or
 timed out waiting for the prompt.
+
+`msp` is MSPv1 only (`$M<`, with the 255-byte jumbo form accepted in replies)
+and sends only the read ids in MSP_READ_ONLY (API_VERSION, FC_VARIANT,
+FC_VERSION, BOARD_INFO, NAME, RC, ANALOG, BOXNAMES, BOXIDS, MODE_RANGES,
+STATUS_EX), with no payload; its one send function raises Refused for any other
+id. It never writes `#`, `exit` or a line, because Betaflight 4.x `exit` reboots
+the board and drops a USB/IP attach. A board in CLI mode ignores MSP: with no
+reply to the first request it exits 2 and sends nothing more (power-cycle the
+board, or run `identify`, which reboots a board before 2025.12, to leave CLI
+mode). Arming-disable names come from the flag-count byte: 26 is the Betaflight
+4.5 table (4.3 and 4.4 name bits 3 and 20 differently, so those print both
+names), 30 the 2026.6.2 table, any other count (2025.12.1 has 29) prints `bit N`. The reply timeout is min(--timeout, 2) s per request. A
+`$M!` error reply is exit 1.
 
 `run` refuses, before connecting, any line whose first word is save, defaults,
 bl, dfu, exit, flash_erase, msc, motor, escprog, serialpassthrough or
@@ -858,13 +877,321 @@ REFUSE_LINES = [
 ]
 
 
+# ---- msp: read-only MSPv1 reads, no CLI -------------------------------------
+# Betaflight 4.x `exit` reboots the board, which drops a USB/IP attach. MSP never
+# enters the CLI and never reboots, so `msp` talks only MSP and never writes
+# `#`, `exit` or a CLI line; the only newline bytes are inside NAME's frame
+# (id 10), sent after the board has answered MSP. It is independent of the CLI class on purpose.
+# The one send function refuses any id outside this allowlist; no request
+# carries a payload. Ids from Betaflight 2026.6.2 src/main/msp/msp_protocol.h.
+MSP_READ_ONLY = {1: 'API_VERSION', 2: 'FC_VARIANT', 3: 'FC_VERSION', 4: 'BOARD_INFO',
+                 10: 'NAME', 105: 'RC', 110: 'ANALOG', 116: 'BOXNAMES', 119: 'BOXIDS',
+                 34: 'MODE_RANGES', 150: 'STATUS_EX'}
+MSP_REQ_TIMEOUT_MAX = 2.0
+
+# armingDisableFlagNames[] by the flag-count byte of MSP_STATUS_EX. The bit order
+# is the array order. They differ at bit 25.
+# Betaflight 4.5.3, src/main/fc/runtime_config.c (26 entries). 4.3 and 4.4 also
+# have 26 but name bit 3 BADRX and bit 20 RPMFILTER, so those two print both.
+ARMING_FLAGS_26 = (
+    'NOGYRO', 'FAILSAFE', 'RXLOSS', 'NOT_DISARMED|BADRX', 'BOXFAILSAFE', 'RUNAWAY', 'CRASH',
+    'THROTTLE', 'ANGLE', 'BOOTGRACE', 'NOPREARM', 'LOAD', 'CALIB', 'CLI', 'CMS', 'BST',
+    'MSP', 'PARALYZE', 'GPS', 'RESCUE_SW', 'DSHOT_TELEM|RPMFILTER', 'REBOOT_REQD', 'DSHOT_BBANG',
+    'NO_ACC_CAL', 'MOTOR_PROTO', 'ARMSWITCH')
+# Betaflight 2026.6.2, src/main/fc/runtime_config.c (30 entries)
+ARMING_FLAGS_30 = (
+    'NOGYRO', 'FAILSAFE', 'RXLOSS', 'NOT_DISARMED', 'BOXFAILSAFE', 'RUNAWAY', 'CRASH',
+    'THROTTLE', 'ANGLE', 'BOOTGRACE', 'NOPREARM', 'LOAD', 'CALIB', 'CLI', 'CMS', 'BST',
+    'MSP', 'PARALYZE', 'GPS', 'RESCUE_SW', 'DSHOT_TELEM', 'REBOOT_REQD', 'DSHOT_BBANG',
+    'NO_ACC_CAL', 'MOTOR_PROTO', 'FLIP_SWITCH', 'ALT_HOLD_SW', 'POS_HOLD_SW',
+    'AUTOPILOT_SW', 'ARM_SWITCH')
+ARMING_FLAG_TABLES = {26: ARMING_FLAGS_26, 30: ARMING_FLAGS_30}
+
+
+class MspBad(Exception):
+    """A malformed or corrupt MSP frame or payload."""
+
+
+class MspError(Exception):
+    """The FC answered `$M!` (it rejected the request)."""
+
+
+class MspTimeout(NoLink):
+    pass
+
+
+def msp_frame(cmd, payload=b'', direction=b'<'):
+    """MSPv1 frame: $M<dir>, len, cmd, payload, XOR of len, cmd and payload.
+    A payload of 255 bytes or more uses the jumbo form (len 255, then a u16 LE size
+    after cmd); the FC sends those (BOXNAMES), this tool never does."""
+    if len(payload) >= 255:
+        body = bytes([255, cmd, len(payload) & 255, len(payload) >> 8]) + bytes(payload)
+    else:
+        body = bytes([len(payload), cmd]) + bytes(payload)
+    ck = 0
+    for b in body:
+        ck ^= b
+    return b'$M' + direction + body + bytes([ck])
+
+
+def msp_unframe(buf):
+    """Parse one frame at the start of buf (which must begin with `$M`).
+    Returns None while incomplete, else (direction, cmd, payload, bytes used).
+    Raises MspBad for a bad header, direction or checksum."""
+    if len(buf) >= 2 and bytes(buf[:2]) != b'$M':
+        raise MspBad('no $M header')
+    if len(buf) < 5:
+        return None
+    d = bytes(buf[2:3])
+    if d not in (b'<', b'>', b'!'):
+        raise MspBad(f'bad direction byte {buf[2]:#04x}')
+    ln, cmd = buf[3], buf[4]
+    head = 5
+    if ln == 255:  # MSPv1 jumbo frame: a u16 LE size follows the command byte
+        if len(buf) < 7:
+            return None
+        ln, head = buf[5] | buf[6] << 8, 7
+    total = head + ln + 1
+    if len(buf) < total:
+        return None
+    ck = 0
+    for b in buf[3:head + ln]:
+        ck ^= b
+    if ck != buf[head + ln]:
+        raise MspBad(f'checksum {buf[head + ln]:#04x}, computed {ck:#04x}')
+    return d.decode(), cmd, bytes(buf[head:head + ln]), total
+
+
+def msp_send(ser, cmd):
+    """The only place MSP bytes are written. Refuses any id off the allowlist."""
+    if cmd not in MSP_READ_ONLY:
+        raise Refused(f"MSP id {cmd} is not on the read-only allowlist; refusing to send it")
+    ser.write(msp_frame(cmd))
+
+
+def msp_request(ser, cmd, timeout, buf):
+    """Send one request and return its payload. buf is the receive buffer, shared
+    across calls. Resyncs on `$M`, drops frames with a bad checksum or another
+    command id. Raises MspTimeout, or MspError for a `$M!` reply."""
+    msp_send(ser, cmd)
+    name = MSP_READ_ONLY[cmd]
+    deadline = time.monotonic() + timeout
+    while True:
+        while True:
+            i = bytes(buf).find(b'$M')
+            if i < 0:
+                del buf[:len(buf) - 1 if buf.endswith(b'$') else len(buf)]
+                break
+            del buf[:i]
+            try:
+                fr = msp_unframe(buf)
+            except MspBad:
+                del buf[:1]
+                continue
+            if fr is None:
+                break
+            d, c, payload, used = fr
+            del buf[:used]
+            if d == '<' or c != cmd:
+                continue
+            if d == '!':
+                raise MspError(f"FC rejected MSP {name} ({cmd}) with an error reply")
+            return payload
+        if time.monotonic() >= deadline:
+            raise MspTimeout(f"no valid reply to MSP {name} ({cmd}) within {timeout:g} s")
+        n = getattr(ser, 'in_waiting', 0) or 1
+        buf.extend(ser.read(n))
+
+
+def u16(p, o):
+    return p[o] | p[o + 1] << 8
+
+
+def msp_text(b):
+    return inert(bytes(b).decode('latin-1'))
+
+
+def parse_fc_version(p):
+    """FC_VERSION: major, minor, patch bytes. Calendar versions send the year since 2000."""
+    if len(p) < 3:
+        raise MspBad('FC_VERSION shorter than 3 bytes')
+    major = p[0] + 2000 if p[0] >= 20 else p[0]
+    return f'{major}.{p[1]}.{p[2]}'
+
+
+def _printable(b):
+    return all(0x20 <= c <= 0x7e for c in b)
+
+
+def parse_board_info(p, api_minor):
+    """(board identifier, board name). Layout (2026.6.2 msp.c): 4-byte identifier,
+    u16 hardware revision, u8 board type, u8 capabilities, then length-prefixed
+    target name, board name, manufacturer id. The strings exist only on newer API
+    versions, so they are parsed only from API 1.37 on (Hypothesis: the
+    threshold; every string is validated, so a wrong guess shows no name, not
+    garbage). The name is the board name, else the target name, else ''."""
+    ident = bytes(p[:4])
+    if len(ident) < 4 or not _printable(ident):
+        return '', ''
+    ident = ident.decode('ascii')
+    name = ''
+    if api_minor >= 37 and len(p) >= 9:
+        try:
+            o, strs = 8, []
+            for _ in range(2):
+                n = p[o]
+                s = bytes(p[o + 1:o + 1 + n])
+                if len(s) != n or not _printable(s):
+                    raise ValueError
+                strs.append(s.decode('ascii'))
+                o += 1 + n
+            name = strs[1] or strs[0]
+        except (ValueError, IndexError):
+            name = ''
+    return ident, name
+
+
+def parse_status_ex(p):
+    """(flag count, arming-disable mask). Offsets (2026.6.2 msp.c MSP_STATUS_EX):
+    15 fixed bytes, a header byte whose low 4 bits count extra flight-mode bytes,
+    those bytes, then the u8 flag count and the u32 mask."""
+    if len(p) < 16:
+        raise MspBad('STATUS_EX shorter than its fixed part')
+    o = 15 + 1 + (p[15] & 0x0f)
+    if len(p) < o + 5:
+        raise MspBad('STATUS_EX ends before the arming-disable flags')
+    return p[o], int.from_bytes(p[o + 1:o + 5], 'little')
+
+
+def arming_names(count, mask):
+    """[(bit, name)] for the set bits in mask, by table for this flag count; `bit N`
+    when the count has no table. Returns (flags, table known)."""
+    table = ARMING_FLAG_TABLES.get(count)
+    flags = [(b, table[b] if table and b < len(table) else f'bit {b}')
+             for b in range(32) if mask >> b & 1]
+    return flags, table is not None
+
+
+def parse_rc(p):
+    return [u16(p, i) for i in range(0, len(p) - 1, 2)]
+
+
+def parse_rssi(p):
+    if len(p) < 5:
+        raise MspBad('ANALOG shorter than 5 bytes')
+    return u16(p, 3)
+
+
+def parse_boxes(names_payload, ids_payload):
+    """permanent id -> name, from BOXNAMES (';'-separated) zipped with BOXIDS."""
+    names = bytes(names_payload).decode('latin-1').split(';')
+    if names and names[-1] == '':
+        names.pop()
+    return dict(zip(ids_payload, names))
+
+
+def parse_mode_ranges(p, boxes):
+    """[(name, channel, low us, high us, start step, end step)], skipping start == end."""
+    out = []
+    for i in range(0, len(p) - 3, 4):
+        pid, aux, start, end = p[i:i + 4]
+        if start == end:
+            continue
+        out.append((boxes.get(pid, f'id {pid}'), aux + 5, 900 + 25 * start, 900 + 25 * end, start, end))
+    return out
+
+
+def mode_state(rng, rc):
+    ch = rng[1]
+    if ch - 1 >= len(rc):
+        return f'{rng[0]} ch{ch}=n/a'
+    v = rc[ch - 1]
+    return f'{rng[0]} ch{ch}={v} {"on" if rng[2] <= v < rng[3] else "off"}'
+
+
+def cmd_msp(a, ser=None, sleep=time.sleep):
+    if a.samples < 1 or a.interval < 0:
+        raise Refused('--samples must be at least 1 and --interval at least 0')
+    if ser is None:
+        port, how = pick_port(a.port)
+        print(f"port: {port} ({how}), {a.baud} baud")
+        try:
+            ser = serial.serial_for_url(port, baudrate=a.baud, timeout=0.1)
+        except (serial.SerialException, OSError) as e:
+            raise NoLink(f"cannot open {port}: {e}")
+    to = min(a.timeout, MSP_REQ_TIMEOUT_MAX)
+    buf = bytearray()
+    try:
+        if hasattr(ser, 'reset_input_buffer'):
+            ser.reset_input_buffer()
+
+        def get(cmd):
+            return msp_request(ser, cmd, to, buf)
+
+        try:
+            api = get(1)
+        except MspTimeout as e:
+            raise NoLink(f"{e}. The board may be in CLI mode (it ignores MSP there) or not "
+                         "running Betaflight. This tool does not send `exit` because that "
+                         "reboots a 4.x board; power-cycling the board gets it out of CLI "
+                         "mode, and so does `bf-cli.py identify`, without a reboot only on "
+                         "firmware from 2025.12.")
+        if len(api) < 3:
+            raise MspBad('API_VERSION shorter than 3 bytes')
+        variant = msp_text(get(2)[:4])
+        version = parse_fc_version(get(3))
+        ident, bname = parse_board_info(get(4), api[2])
+        craft = msp_text(get(10))
+        boxes = parse_boxes(get(116), get(119))
+        ranges = parse_mode_ranges(get(34), boxes)
+        board = ' '.join(dict.fromkeys(x for x in (inert(ident), inert(bname)) if x))
+        print(f"fc: {variant} {version}, MSP API {api[1]}.{api[2]}"
+              + (f", board {board}" if board else "") + f", craft {craft or '-'}")
+        print("modes: " + ('; '.join(f"{n} ch{c} {lo}-{hi}" for n, c, lo, hi, _, _ in ranges)
+                           if ranges else "none configured"))
+        counts, last_rc, changed, intervals, noted = {}, None, 0, 0, False
+        for i in range(1, a.samples + 1):
+            count, mask = parse_status_ex(get(150))
+            rssi = parse_rssi(get(110))
+            rc = parse_rc(get(105))
+            flags, known = arming_names(count, mask)
+            if not known and not noted:
+                print(f"note: names are unknown for flag count {count} (known: 26, 30)")
+                noted = True
+            for b, n in flags:
+                counts[b] = (n, counts.get(b, (n, 0))[1] + 1)
+            if last_rc is not None:
+                intervals += 1
+                changed += rc != last_rc
+            last_rc = rc
+            print(f"sample {i}/{a.samples}: arming disabled: {' '.join(n for _, n in flags) or 'none'}"
+                  f" | rssi {rssi}/1023 ({round(rssi * 100 / 1023)}%) | rc {' '.join(map(str, rc)) or '(no channels)'}")
+            if i < a.samples:
+                sleep(a.interval)
+        tally = ', '.join(f"{n} {c}/{a.samples}" for _, (n, c) in sorted(counts.items()))
+        print(f"summary over {a.samples} samples: {tally or 'no arming-disable flags'}; "
+              + (f"rc frames changed in {changed}/{intervals} intervals" if intervals
+                 else "rc change needs 2 or more samples"))
+        if ranges:
+            print("modes now (last sample): " + '; '.join(mode_state(r, last_rc) for r in ranges))
+        return 0
+    except MspBad as e:
+        raise NoLink(f"unusable MSP reply: {e}")
+    except MspError as e:
+        print(f"MSP ERROR: {e}")
+        return 1
+    finally:
+        if hasattr(ser, 'close'):
+            ser.close()
+
+
 def selftest():
     """Offline checks of the line gate, restore_lines, first_word and inert."""
     results = []
 
-    def check(name, ok):
+    def check(name, ok, detail=''):
         results.append(ok)
-        print(f"{'PASS' if ok else 'FAIL'}: {name}")
+        print(f"{'PASS' if ok else 'FAIL'}: {name}" + ('' if ok or detail == '' else f"  [{detail!r}]"))
 
     def refused(fn, *args):
         try:
@@ -963,6 +1290,200 @@ def selftest():
           '\x1b' not in ''.join(header({'version': '1\x1b', 'board': 'B\x07', 'mcu': 'M\x9b',
                                         'craft': 'C\x1b[2J'}, 'p', 'diff all')))
 
+    # msp: framing, checksum, gate, tables, decode, and what is ever written
+    import struct, io, contextlib
+    fr = msp_frame(1)
+    check("msp request frame is $M< len cmd checksum", fr == b'$M<\x00\x01\x01')
+    check("msp checksum is XOR of len, cmd, payload",
+          msp_frame(105, b'\x01\x02', b'>') == b'$M>\x02\x69\x01\x02' + bytes([2 ^ 0x69 ^ 1 ^ 2]))
+    check("msp unframe round-trips", msp_unframe(msp_frame(110, b'abc', b'>')) == ('>', 110, b'abc', 9))
+    check("msp unframe: incomplete is None", msp_unframe(msp_frame(110, b'abc', b'>')[:-1]) is None)
+    jp = bytes(range(256)) * 2
+    check("msp jumbo frame round-trips", msp_unframe(msp_frame(116, jp, b'>'))[:3] == ('>', 116, jp))
+    bad = bytearray(msp_frame(110, b'abc', b'>'))
+    bad[-1] ^= 1
+
+    def raises(exc, fn, *args):
+        try:
+            fn(*args)
+        except exc:
+            return True
+        return False
+    check("msp bad checksum rejected", raises(MspBad, msp_unframe, bytes(bad)))
+    check("msp bad header rejected", raises(MspBad, msp_unframe, b'$X>\x00\x01\x01'))
+
+    class Wire:
+        """Fake serial: records every byte written; answers well-formed requests
+        from `answers` (cmd -> payload); `junk` is sent first; no answers = silent."""
+        def __init__(self, answers=None, junk=b'', errors=()):
+            self.answers, self.errors, self.rx, self.written = answers or {}, errors, bytearray(junk), bytearray()
+            self.closed = False
+
+        @property
+        def in_waiting(self):
+            return len(self.rx)
+
+        def reset_input_buffer(self):
+            pass
+
+        def write(self, data):
+            self.written += data
+            d = bytes(data)
+            ok = d[:3] == b'$M<' and len(d) >= 6
+            if ok:
+                _, c, payload, _ = msp_unframe(d)
+                if c in self.errors:
+                    self.rx += msp_frame(c, b'', b'!')
+                elif c in self.answers:
+                    ans = self.answers[c]
+                    self.rx += msp_frame(c, ans() if callable(ans) else ans, b'>')
+
+        def read(self, n=1):
+            time.sleep(0.001)
+            out, self.rx = bytes(self.rx[:n]), self.rx[n:]
+            return out
+
+        def close(self):
+            self.closed = True
+
+    def sent_frames(w):
+        out, b = [], bytes(w.written)
+        while b:
+            f = msp_unframe(b)
+            if f is None or f[0] != '<' or f[2]:
+                return None
+            out.append(f[1])
+            b = b[f[3]:]
+        return out
+
+    check("msp allowlist has no id >= 200 or in {68, 99, 11}",
+          all(i < 200 and i not in (68, 99, 11) for i in MSP_READ_ONLY))
+    for bad_id in (68, 99, 200, 11):
+        w = Wire()
+        check(f"msp gate refuses id {bad_id} and writes nothing",
+              raises(Refused, msp_send, w, bad_id) and not w.written)
+    check("msp gate refuses a request with a payload-free id outside the set (255)", raises(Refused, msp_send, Wire(), 255))
+    check("arming table 26 ends ARMSWITCH at bit 25", len(ARMING_FLAGS_26) == 26 and ARMING_FLAGS_26[25] == 'ARMSWITCH')
+    check("arming table 30 has FLIP_SWITCH at 25 and ARM_SWITCH at 29",
+          len(ARMING_FLAGS_30) == 30 and ARMING_FLAGS_30[25] == 'FLIP_SWITCH' and ARMING_FLAGS_30[29] == 'ARM_SWITCH')
+    check("arming 26: bit 25 is ARMSWITCH", arming_names(26, 1 << 25) == ([(25, 'ARMSWITCH')], True))
+    check("arming 30: bits 2 and 25 are RXLOSS and FLIP_SWITCH",
+          arming_names(30, 4 | 1 << 25) == ([(2, 'RXLOSS'), (25, 'FLIP_SWITCH')], True))
+    check("arming 30: bit 29 is ARM_SWITCH", arming_names(30, 1 << 29)[0] == [(29, 'ARM_SWITCH')])
+    check("arming unknown count 28 prints bit N and says unknown",
+          arming_names(28, 1 | 1 << 20) == ([(0, 'bit 0'), (20, 'bit 20')], False))
+    check("arming mask 0 is no flags", arming_names(30, 0) == ([], True))
+
+    def status_ex(count, mask, extra=0):
+        return (b'\x00' * 15 + bytes([extra]) + b'\xaa' * extra + bytes([count]) + struct.pack('<I', mask)
+                + b'\x00' * 8)
+    check("status_ex flags read after 0 extra flight-mode bytes", parse_status_ex(status_ex(30, 0x14)) == (30, 0x14))
+    check("status_ex flags skip 3 extra flight-mode bytes", parse_status_ex(status_ex(26, 1 << 25, 3)) == (26, 1 << 25))
+    check("status_ex header uses the low 4 bits only", parse_status_ex(status_ex(30, 7, 2)[:15] + b'\xf2' + status_ex(30, 7, 2)[16:]) == (30, 7))
+    check("status_ex too short is rejected", raises(MspBad, parse_status_ex, b'\x00' * 17))
+    check("fc version calendar bytes", parse_fc_version(bytes([26, 6, 2]) + b'\x052026.6.2'[:6]) == '2026.6.2')
+    check("fc version 4.5.3", parse_fc_version(bytes([4, 5, 3])) == '4.5.3')
+
+    def board(ident=b'SH74', names=(b'TBS', b'TBS_LUCID_H7', b'TBS')):
+        return ident + b'\x00\x00\x00\x01' + b''.join(bytes([len(n)]) + n for n in names) + b'\x00' * 40
+    check("board info: identifier and board name", parse_board_info(board(), 46) == ('SH74', 'TBS_LUCID_H7'))
+    check("board info: empty board name falls back to target name",
+          parse_board_info(board(names=(b'TGT', b'', b'')), 46) == ('SH74', 'TGT'))
+    check("board info: old API prints the identifier only", parse_board_info(board(), 30) == ('SH74', ''))
+    check("board info: a string running past the payload prints the identifier only",
+          parse_board_info(b'SH74\x00\x00\x00\x01\x40abc', 46) == ('SH74', ''))
+    check("board info: control bytes in a name are not shown",
+          parse_board_info(board(names=(b'T', b'A\x1bB', b'')), 46) == ('SH74', ''))
+    check("board info: garbage identifier prints nothing", parse_board_info(b'\x00\x01\x02\x03' + b'\x00' * 20, 46) == ('', ''))
+    boxes = parse_boxes(b'ARM;ANGLE;BEEPER;', bytes([0, 1, 13]))
+    check("boxnames zip boxids into permanent id -> name", boxes == {0: 'ARM', 1: 'ANGLE', 13: 'BEEPER'})
+    mr = parse_mode_ranges(bytes([0, 0, 32, 48, 1, 2, 16, 32, 13, 2, 32, 48, 5, 3, 7, 7, 0, 0, 0, 0]), boxes)
+    check("mode ranges: us = 900 + 25 x step, channel = aux + 5, start == end skipped",
+          mr == [('ARM', 5, 1700, 2100, 32, 48), ('ANGLE', 7, 1300, 1700, 16, 32), ('BEEPER', 7, 1700, 2100, 32, 48)], mr)
+    check("mode_state: in range is on, outside off, missing channel n/a",
+          mode_state(('ARM', 5, 1700, 2100, 32, 48), [0, 0, 0, 0, 1800]) == 'ARM ch5=1800 on'
+          and mode_state(('ARM', 5, 1700, 2100, 32, 48), [0, 0, 0, 0, 2100]) == 'ARM ch5=2100 off'
+          and mode_state(('ARM', 5, 1700, 2100, 32, 48), [0, 0]) == 'ARM ch5=n/a')
+    check("rc channels counted from the payload length", parse_rc(struct.pack('<3H', 1500, 988, 2011)) == [1500, 988, 2011])
+    check("rssi is the u16 at offset 3", parse_rssi(b'\x00\x00\x00' + struct.pack('<H', 714) + b'\x00' * 4) == 714)
+
+    def good_answers(mask=4 | 1 << 20, count=30, rcs=None):
+        seq = iter(rcs or [[1500, 988, 2011]] * 4)
+        return {1: bytes([0, 1, 46]), 2: b'BTFL', 3: bytes([26, 6, 2]) + b'\x082026.6.2',
+                4: board(), 10: b'BLACK\x1bFOOT', 116: b'ARM;ANGLE;BEEPER;', 119: bytes([0, 1, 13]),
+                34: bytes([0, 0, 32, 48, 1, 2, 16, 32, 13, 2, 32, 48]),
+                150: status_ex(count, mask), 110: b'\x00' * 3 + struct.pack('<H', 714) + b'\x00' * 4,
+                105: lambda: struct.pack(f'<{len(c := next(seq))}H', *c)}
+
+    def run_msp(wire, samples=3, argv_timeout=30.0):
+        ns = argparse.Namespace(samples=samples, interval=0.0, timeout=argv_timeout, port=None, baud=115200)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_msp(ns, ser=wire, sleep=lambda s: None)
+        except NoLink as e:
+            rc, _ = 2, buf.write(f"NO LINK: {e}\n")
+        except Refused as e:
+            rc, _ = 1, buf.write(f"REFUSED: {e}\n")
+        return rc, buf.getvalue()
+
+    w = Wire(good_answers(rcs=[[1500, 1500, 988, 1500, 988, 2011, 988], [1500, 1500, 988, 1500, 988, 2011, 988], [1500, 1500, 988, 1500, 988, 2011, 1000]]), junk=b'\xff$$Mjunk')
+    rc, o = run_msp(w)
+    check("msp decodes a full run: exit 0", rc == 0, o)
+    check("msp header line", "fc: BTFL 2026.6.2, MSP API 1.46, board SH74 TBS_LUCID_H7, craft BLACK\\x1bFOOT" in o, o)
+    check("msp modes line", "modes: ARM ch5 1700-2100; ANGLE ch7 1300-1700; BEEPER ch7 1700-2100" in o, o)
+    check("msp sample line names flags, rssi percent and rc",
+          "sample 1/3: arming disabled: RXLOSS DSHOT_TELEM | rssi 714/1023 (70%) | rc 1500 1500 988 1500 988 2011 988" in o, o)
+    check("msp summary counts flags and rc changes",
+          "summary over 3 samples: RXLOSS 3/3, DSHOT_TELEM 3/3; rc frames changed in 1/2 intervals" in o, o)
+    check("msp modes now uses the last sample",
+          "modes now (last sample): ARM ch5=988 off; ANGLE ch7=1000 off; BEEPER ch7=1000 off" in o, o)
+    check("msp output has no raw ESC", '\x1b' not in o)
+    ids = sent_frames(w)
+    check("msp wrote only well-formed payload-free $M< requests with allowlisted ids",
+          ids is not None and all(i in MSP_READ_ONLY for i in ids) and ids[0] == 1 and len(ids) == 8 + 3 * 3, ids)
+    # NAME is id 10, so its frame holds byte 0x0a twice (cmd, and the checksum len^cmd). That is
+    # inside a well-formed frame, sent only after API_VERSION (id 1, no 0x0a/0x23/0x0d) was answered.
+    check("msp wrote no #, no CR, no 'exit'; a newline byte only as NAME's id, after the first reply",
+          b'#' not in w.written and b'\r' not in w.written and b'exit' not in w.written
+          and b'\n' not in msp_frame(1) and bytes(w.written).count(b'\n') == 2)
+    check("msp closes the port", w.closed)
+    rc, o = run_msp(Wire(good_answers(mask=0)), samples=1)
+    check("msp mask 0 prints arming disabled: none", rc == 0 and "arming disabled: none" in o and 'no arming-disable flags' in o, o)
+    rc, o = run_msp(Wire(good_answers(count=28, mask=1 << 3)), samples=2)
+    check("msp unknown flag count: bit N and a note", rc == 0 and 'arming disabled: bit 3' in o and 'names are unknown for flag count 28' in o, o)
+    rc, o = run_msp(Wire(good_answers(count=26, mask=1 << 25)), samples=1)
+    check("msp 26-flag board decodes ARMSWITCH", 'arming disabled: ARMSWITCH' in o, o)
+    rc, o = run_msp(Wire(good_answers(), errors=(150,)), samples=1)
+    check("msp $M! reply is exit 1", rc == 1 and 'MSP ERROR' in o, (rc, o))
+    w = Wire({1: bytes([0, 1, 46])})
+    w.rx = bytearray(b'$M>\x03\x01\x00\x01\x2e\x00')  # stale frame with a bad checksum, then silence
+    rc, o = run_msp(w, argv_timeout=0.05)
+    check("msp bad checksum on a reply is not accepted", rc == 2, (rc, o))
+    w = Wire()
+    rc, o = run_msp(w, argv_timeout=0.05)
+    check("msp no reply: exit 2, one request written, nothing else",
+          rc == 2 and bytes(w.written) == msp_frame(1) and sent_frames(w) == [1], (rc, bytes(w.written)))
+    check("msp no reply: message names CLI mode, no exit sent, power cycle and identify",
+          'CLI mode' in o and 'does not send `exit`' in o and 'power-cycling' in o and 'identify' in o, o)
+    w = Wire(good_answers(), errors=())
+    del w.answers[34]
+    rc, o = run_msp(w, argv_timeout=0.05)
+    check("msp timeout after the first reply is exit 2", rc == 2 and 'MODE_RANGES' in o, o)
+    check("msp refuses --samples 0", run_msp(Wire(), samples=0)[0] == 1)
+    # through main(): exit 2 on an unopenable port
+    saved_argv, saved_sfu = sys.argv, serial.serial_for_url
+    try:
+        sys.argv = ['bf-cli.py', '--port', 'socket://127.0.0.1:1', 'msp']
+        def _boom(*a, **k):
+            raise OSError('refused')
+        serial.serial_for_url = _boom
+        with contextlib.redirect_stdout(io.StringIO()):
+            mrc = main()
+        check("msp via main: unopenable port is exit 2", mrc == 2)
+    finally:
+        sys.argv, serial.serial_for_url = saved_argv, saved_sfu
+
     failed = results.count(False)
     print(f"{results.count(True)} passed, {failed} failed")
     return 1 if failed else 0
@@ -995,6 +1516,9 @@ def main():
     r = sub.add_parser('run', help='send CLI lines; saves only with --save')
     r.add_argument('commands', nargs='+')
     r.add_argument('--save', action='store_true', help='end with `save noreboot` (default: `exit`, which discards)')
+    m = sub.add_parser('msp', help='read-only over MSP; never enters the CLI, never reboots')
+    m.add_argument('--samples', type=int, default=10, help='status lines to print (default 10)')
+    m.add_argument('--interval', type=float, default=0.2, help='seconds between samples (default 0.2)')
     s = sub.add_parser('restore', help='put a backup file back, pinned')
     s.add_argument('file')
     s.add_argument('--expect-board', required=True)
@@ -1003,7 +1527,7 @@ def main():
     a = ap.parse_args()
     try:
         return {'identify': cmd_identify, 'backup': cmd_backup, 'run': cmd_run,
-                'restore': cmd_restore}[a.cmd](a)
+                'restore': cmd_restore, 'msp': cmd_msp}[a.cmd](a)
     except Refused as e:
         print(f"REFUSED: {e}")
         return 1

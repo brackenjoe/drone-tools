@@ -47,7 +47,7 @@ to 2 (fixed upstream in 2.4.50).
 | `ap-heading-watch.py` | Read-only, once a second: the EKF's yaw beside the compass heading computed from the raw field, the field strength, the EKF flags and compass variance, the GPS fix and satellite count (never a position); optional CSV and a gyro-only yaw for a box that stands still. `--selftest` checks the heading arithmetic. | pymavlink (not for `--selftest`) |
 | `sitl-qhover-steps.py` | Flies an already-running SITL quadplane or copter tailsitter a hover-only step profile (climb, hands-off hold, yaw steps, roll and pitch steps, land) and writes each phase's start and end in vehicle time, so a log can be cut by phase. Refuses to arm anything that is not SITL, and to fly if the parameters you name are not on the vehicle; fails if the climb does not reach its target. | pymavlink |
 | `vtol-yaw-metrics.py` | Yaw-authority metrics off a hover log: does the yaw rate follow its demand, how far does heading drift hands-off, how hard is the yaw controller working, are the motors saturating, and what the CW-minus-CCW motor split answers to (yaw, roll or pitch demand), with the motors named by number as the props are built. `--selftest` runs on synthetic rows. | pymavlink, numpy |
-| `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. | `pyserial` |
+| `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. `msp` reads why the board will not arm over MSP, without entering the CLI. | `pyserial` |
 | `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing`, `invalid` or `unchecked`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
 
 Without `--device` or `--port`, `ap-ftp-get.py`, `ap-param-dump.py`,
@@ -392,6 +392,7 @@ yaw-axis split. Positions are never read. Needs numpy.
     bf-cli.py backup -o DIR [--dump]
     bf-cli.py run "set craft_name = MYQUAD" [--save]
     bf-cli.py restore FILE --expect-board TARGET --expect-version 2026.6.2 [--save]
+    bf-cli.py msp [--samples 10] [--interval 0.2]
     bf-cli.py --port socket://127.0.0.1:5761 identify      # Betaflight SITL
 
 Exit 0 ok; 1 refused, a read-back mismatch, a CLI error, or a backup
@@ -423,8 +424,27 @@ runs the gate's cases offline.
 On firmware before 2025.12 every command ends in a reboot, because `exit`
 always reboots there; the tool reads the version and says so.
 
-`bf-cli-sitl-check.sh` is its test, 92 checks against Betaflight SITL (91
-without shellcheck; no hardware). It needs bash, python3 with pyserial, `setsid` and `pgrep`;
+`msp` answers "why will it not arm" without that reboot. It is read-only
+and speaks MSP, never the CLI: it prints the firmware variant, version,
+board and craft name, the mode ranges, then `--samples` lines `--interval`
+seconds apart with the arming-disable flags, RSSI and the RC channels, a
+summary, and which modes the last RC frame switches on. It is MSPv1 only
+and sends eleven read requests with no payload (API_VERSION, FC_VARIANT,
+FC_VERSION, BOARD_INFO, NAME, RC, ANALOG, BOXNAMES, BOXIDS, MODE_RANGES,
+STATUS_EX); its one send function refuses any other id. A board that is in
+CLI mode ignores MSP: with no reply to the first request `msp` exits 2 and
+sends nothing more. To leave CLI mode, power-cycle the board or run
+`identify`; on firmware before 2025.12 `identify` reboots it too. The flag
+names come from the count the board reports: 26 flags is read as the
+Betaflight 4.5 table, 30 as the 2026.6.2 table, and any other count prints
+`bit N` in place of names; 2025.12.1 has 29, so it gets `bit N`. 4.3 and
+4.4 also report 26 but name bit 3 `BADRX` and bit 20 `RPMFILTER`, so those
+two print as `NOT_DISARMED|BADRX` and `DSHOT_TELEM|RPMFILTER`. An MSP error reply is exit 1.
+The checks run against 2026.6.2 SITL; the 26-flag table was read from
+Betaflight 4.5.3's source.
+
+`bf-cli-sitl-check.sh` is its test, 190 checks against Betaflight SITL (189
+without shellcheck; no hardware). It needs bash, python3 with pyserial, `setsid`, `pgrep` and `sha256sum`;
 `shellcheck` is used if installed. Build SITL in the repo directory and run:
 
     git clone --depth 1 --branch 2026.6.2 https://github.com/betaflight/betaflight
