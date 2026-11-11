@@ -206,15 +206,28 @@ back. Exit 0 on an autopilot heartbeat (or on silence with
 The test of `ap-ftp-get.py`, `ap-param-dump.py`, `ap-param-apply.py`,
 `ap-upgrade-verify.py` and `mavlink-listen.py` against ArduCopter 4.7.1
 SITL: 94 checks, about 7.5 minutes, no hardware. It needs ArduCopter SITL
-built from ArduPilot's `Copter-4.7.1` tag. Install ArduPilot's build
-prerequisites first, as its
-[BUILD.md](https://github.com/ArduPilot/ardupilot/blob/master/BUILD.md)
-describes (`Tools/environment_install/` has a script per platform); then,
-in the repo directory:
+built from ArduPilot's `Copter-4.7.1` tag, and `pymavlink` in the Python
+that runs the check (without it the check exits 101). On Ubuntu, as a
+normal user with `sudo` (ArduPilot's script refuses root), in the repo
+directory:
 
     git clone --recurse-submodules --branch Copter-4.7.1 https://github.com/ArduPilot/ardupilot
+    ardupilot/Tools/environment_install/install-prereqs-ubuntu.sh
+    source ~/venv-ardupilot/bin/activate
     (cd ardupilot && ./waf configure --board sitl && ./waf copter)
     python3 ap-sitl-check.py
+
+The prerequisite scripts are in the tree, so the clone comes first;
+`Tools/environment_install/` has one per platform. On Ubuntu 24.04 the
+script makes a Python venv, `~/venv-ardupilot`, with what the build needs
+and `pymavlink`, and asks whether to activate it in every new shell; the
+`source` line above is for the default answer, no. Build and run the
+check in that venv. These steps are read from ArduPilot's script at the
+tag; they have not been run end to end on a fresh machine. ArduPilot's
+[BUILD.md](https://github.com/ArduPilot/ardupilot/blob/Copter-4.7.1/BUILD.md)
+covers `waf` itself and says not to run it with `sudo`. The clone with
+its submodules is about 1.9 GB; the prerequisites and the build add to
+that.
 
 It takes the binary from `ardupilot/build/sitl/bin/arducopter` and the
 defaults from the same tree; `AP_SITL` and `AP_DEFAULTS` point it
