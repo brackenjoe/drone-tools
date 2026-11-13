@@ -12,8 +12,8 @@
 # Build the SITL once:  clone Betaflight at tag 2026.6.2, then `make TARGET=SITL`.
 # Run:                  BF_SITL=/path/to/betaflight_SITL.elf bf-cli-sitl-check.sh
 #                       (BF_SITL unset: ./betaflight/obj/main/betaflight_SITL.elf beside this script)
-# 190 checks (189 when shellcheck is not installed: that one is skipped, not
-# counted), 83 of them for the refusals and the restore allowlist (section
+# 193 checks (192 when shellcheck is not installed: that one is skipped, not
+# counted), 86 of them for the refusals and the restore allowlist (section
 # 9g). Exit status is the number of failed checks (0 = all passed), or 2 if
 # SITL could not be started. The SITL this script started is killed on exit.
 set -u
@@ -121,7 +121,7 @@ fi
 ls "$work"/b1/*.dump >/dev/null 2>&1 && ok ".dump written" || bad "no .dump written"
 
 # 5 run refusals and errors
-for c in save defaults bl dfu exit flash_erase msc; do
+for c in save defaults bl dfu exit flash_erase msc "dshotprog 0 1" "flash_write 0 x" "dxw 20000000 0"; do
     out=$(bf run "$c" 2>&1)
     rc=$?
     if [ "$rc" -eq 1 ] && grep -q REFUSED <<<"$out" && ! grep -q '^port:' <<<"$out"; then

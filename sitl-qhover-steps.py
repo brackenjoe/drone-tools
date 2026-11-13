@@ -46,6 +46,8 @@ sets QLAND and exits 1 with FAIL.
 import argparse
 import json
 import math
+import os
+import re
 import sys
 import time
 
@@ -86,12 +88,103 @@ try:
 except ImportError:
     sys.exit("pymavlink not found. Try: pip install 'pymavlink>=2.4.50'")
 
+def pin_autopilot(m, secs):
+    """The autopilot's heartbeat, not whichever arrives first: through a
+    router or on a shared link the first one may be a GCS's. None on timeout."""
+    end = time.time() + secs
+    while time.time() < end:
+        msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
+        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+            m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
+            return msg
+    return None
+
+
+def recv_from(m, types, sysid, compid, timeout, condition=None):
+    """recv_match that takes a message only from the pinned autopilot
+    (sysid, compid). A message from anyone else is skipped and the wait goes
+    on to its own deadline, so a foreign message neither ends the wait early
+    nor is taken as the answer. None on timeout."""
+    end = time.time() + timeout
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return None
+        msg = m.recv_match(type=types, blocking=True, timeout=left, condition=condition)
+        if msg is None:
+            return None
+        if msg.get_srcSystem() == sysid and msg.get_srcComponent() == compid:
+            return msg
+
+
+def inert(s):
+    """s with every C0 control (newline too), DEL and C1 control as \\xNN, so
+    text from the vehicle cannot move the cursor, recolour the terminal or
+    start a new line."""
+    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+
+
+def parse_param_file(path):
+    """[(name, value)] from a parameter file, split as ArduPilot's
+    AP_Param::parse_param_line does: tokens separated by any of ", =\t", and
+    an optional third token that must be @READONLY. A line that is neither
+    blank, a comment nor that, or a file with no parameter at all, is refused
+    with exit 1: a skipped line is a parameter the flight would silently not
+    check."""
+    out = []
+    first_bad = None
+    with open(path) as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.split('#')[0].strip()
+            if not line:
+                continue
+            parts = [t for t in re.split('[, =\t]+', line) if t]
+            try:
+                if len(parts) == 3 and parts[2] == '@READONLY':
+                    parts = parts[:2]
+                if len(parts) != 2:
+                    raise ValueError
+                val = float(parts[1])
+                if not math.isfinite(val):
+                    raise ValueError
+            except ValueError:
+                if first_bad is None:
+                    first_bad = n
+                continue
+            out.append((parts[0], val))
+    if first_bad is not None:
+        sys.exit(f"FAIL: {inert(path)}: line {first_bad} is not NAME VALUE; "
+                 "refusing to fly with a parameter file that is not all read")
+    if not out:
+        sys.exit(f"FAIL: {inert(path)}: no parameter found")
+    return out
+
+
+# Files are read, and a stale phases file removed, before connecting, so a bad
+# file or a failed run leaves nothing for vtol-yaw-metrics.py to pick up.
+PARAM_FILES = [(path, parse_param_file(path)) for path in a.check_params]
+if a.phases_out and not a.params_only:
+    try:
+        os.remove(a.phases_out)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.exit(f"FAIL: cannot remove old {inert(a.phases_out)}: {inert(e)}")
+
 m = mavutil.mavlink_connection(a.device, source_system=255)
 print(f"waiting for heartbeat on {a.device} ...", flush=True)
-if m.wait_heartbeat(timeout=120) is None:
+if pin_autopilot(m, 120) is None:
     sys.exit(f"FAIL: no heartbeat on {a.device}")
-m.mav.request_data_stream_send(m.target_system, m.target_component,
-                               mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
+SYS, COMP = m.target_system, m.target_component
+
+
+def rx(types, timeout):
+    """The next message of these types from the pinned autopilot only."""
+    return recv_from(m, types, SYS, COMP, timeout)
+
+
+m.mav.request_data_stream_send(SYS, COMP, mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
 
 last_boot_ms = [None]
 
@@ -108,18 +201,17 @@ def note(msg):
 
 def recv(types, timeout=1.0):
     want = list(types) + ['SYSTEM_TIME', 'ATTITUDE']
-    msg = m.recv_match(type=want, blocking=True, timeout=timeout)
+    msg = rx(want, timeout)
     note(msg)
     return msg
 
 
 def read_param(name, timeout=8.0):
     for _ in range(3):
-        m.mav.param_request_read_send(m.target_system, m.target_component,
-                                      name.encode('ascii'), -1)
+        m.mav.param_request_read_send(SYS, COMP, name.encode('ascii'), -1)
         deadline = time.time() + timeout / 3
         while time.time() < deadline:
-            msg = m.recv_match(type='PARAM_VALUE', blocking=True, timeout=1)
+            msg = rx('PARAM_VALUE', 1)
             if msg is None:
                 continue
             got = msg.param_id
@@ -128,19 +220,6 @@ def read_param(name, timeout=8.0):
             if got.rstrip('\x00') == name:
                 return msg.param_value
     return None
-
-
-def parse_param_file(path):
-    out = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.split('#')[0].strip()
-            if not line:
-                continue
-            parts = line.replace(',', ' ').split()
-            if len(parts) == 2:
-                out.append((parts[0], float(parts[1])))
-    return out
 
 
 # This arms and flies. Only a SITL has SIM_* parameters.
@@ -153,18 +232,18 @@ if sim_speedup is None:
 print(f"SITL confirmed (SIM_SPEEDUP = {sim_speedup:g})", flush=True)
 
 bad = []
-for path in a.check_params:
-    wanted = parse_param_file(path)
-    print(f"\nchecking {len(wanted)} parameters from {path}", flush=True)
+for path, wanted in PARAM_FILES:
+    print(f"\nchecking {len(wanted)} parameters from {inert(path)}", flush=True)
     ok = 0
     for name, want in wanted:
         got = read_param(name)
         if got is None:
-            print(f"  MISSING  {name}", flush=True)
-            bad.append(name)
+            print(f"  MISSING  {inert(name)}  ({inert(path)})", flush=True)
+            bad.append(inert(name))
         elif not math.isclose(got, want, rel_tol=1e-5, abs_tol=1e-6):
-            print(f"  MISMATCH {name:18} want {want!r} got {got!r}", flush=True)
-            bad.append(name)
+            print(f"  MISMATCH {inert(name):18} want {want!r} got {got!r}  "
+                  f"({inert(path)})", flush=True)
+            bad.append(inert(name))
         else:
             ok += 1
     print(f"  {ok} of {len(wanted)} read back equal", flush=True)
@@ -199,7 +278,7 @@ def phase(name):
 
 def rc(ch1=1500, ch2=1500, ch3=1500, ch4=1500):
     """Override the four sticks; 5-8 released (FLTMODE_CH is 5)."""
-    m.mav.rc_channels_override_send(m.target_system, m.target_component,
+    m.mav.rc_channels_override_send(SYS, COMP,
                                     ch1, ch2, ch3, ch4, 0, 0, 0, 0)
 
 
@@ -222,12 +301,12 @@ def hold(seconds, sticks):
 def set_mode(name):
     want = MODE[name]
     for _ in range(4):
-        m.mav.set_mode_send(m.target_system,
+        m.mav.set_mode_send(SYS,
                             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                             want)
         deadline = time.time() + 5
         while time.time() < deadline:
-            hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
+            hb = rx('HEARTBEAT', 2)
             if hb and hb.custom_mode == want:
                 print(f"  mode = {name} ({want})", flush=True)
                 return True
@@ -239,32 +318,40 @@ def arm():
     why = ''
     for _ in range(60):
         rc(1500, 1500, 1000, 1500)
-        m.mav.command_long_send(m.target_system, m.target_component,
+        m.mav.command_long_send(SYS, COMP,
                                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                                 0, 1, 0, 0, 0, 0, 0, 0)
-        ack = m.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-        if ack and ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM \
-                and ack.result == 0:
-            print("  ARMED", flush=True)
-            return
+        # Only the autopilot's ack of this command counts.
+        end = time.time() + 5
+        while time.time() < end:
+            ack = rx('COMMAND_ACK', end - time.time())
+            if ack is not None and ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+                if ack.result == 0:
+                    print("  ARMED", flush=True)
+                    return
+                break
         end = time.time() + 2
         while time.time() < end:
-            st = m.recv_match(type='STATUSTEXT', blocking=True, timeout=1)
-            if st and 'rm' in st.text and st.text != why:
-                why = st.text
+            st = rx('STATUSTEXT', 1)
+            if st and 'rm' in st.text and inert(st.text) != why:
+                why = inert(st.text)
                 print(f"    {why}", flush=True)
     sys.exit(f"FAIL: could not arm: {why}")
 
 
 def armed():
-    hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
-    return bool(hb and hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+    """True or False from the autopilot's own heartbeat; None if none came, which
+    is not evidence of a landing."""
+    hb = rx('HEARTBEAT', 3)
+    if hb is None:
+        return None
+    return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
 
 print("\nwaiting for GPS 3D fix ...", flush=True)
 deadline = time.time() + 180
 while time.time() < deadline:
-    msg = m.recv_match(type='GPS_RAW_INT', blocking=True, timeout=5)
+    msg = rx('GPS_RAW_INT', 5)
     if msg and msg.fix_type >= 3:
         break
 else:
@@ -272,7 +359,8 @@ else:
 
 # Q_OPTIONS bit 18 (ARMVTOL) refuses to arm outside a VTOL mode, so the mode
 # is set first.
-set_mode('QHOVER')
+if not set_mode('QHOVER'):
+    sys.exit("FAIL: mode QHOVER not confirmed; not arming")
 phase('ground')
 arm()
 
@@ -290,8 +378,7 @@ else:
     print(f"  {alt:.1f} m", flush=True)
     rc(1500, 1500, 1500, 1500)
     set_mode('QLAND')
-    m.mav.rc_channels_override_send(m.target_system, m.target_component,
-                                    0, 0, 0, 0, 0, 0, 0, 0)
+    m.mav.rc_channels_override_send(SYS, COMP, 0, 0, 0, 0, 0, 0, 0, 0)
     sys.exit(f"FAIL: the climb reached {alt:.1f} m of the {a.alt:g} m target in 90 s; "
              "QLAND set")
 print(f"  {alt:.1f} m", flush=True)
@@ -320,14 +407,13 @@ deadline = time.time() + 180
 landed = False
 while time.time() < deadline:
     rc(1500, 1500, 1500, 1500)
-    if not armed():
+    if armed() is False:
         landed = True
         break
     recv(['GLOBAL_POSITION_INT'], timeout=0.5)
 phase('disarmed' if landed else 'timeout')
 phases[-1]['end_ms'] = phases[-1]['start_ms']
-m.mav.rc_channels_override_send(m.target_system, m.target_component,
-                                0, 0, 0, 0, 0, 0, 0, 0)
+m.mav.rc_channels_override_send(SYS, COMP, 0, 0, 0, 0, 0, 0, 0, 0)
 
 print(f"\npeak |plane roll or yaw rate| over MAVLink ATTITUDE: "
       f"{peak['yaw_rate_dps']:.0f} deg/s",

@@ -24,7 +24,7 @@ Usage:
   ap-version.py udp:0.0.0.0:14550     # a real vehicle over telemetry
   ap-version.py /dev/ttyACM0 --baud 115200
 """
-import sys, time, argparse
+import re, sys, time, argparse
 from pymavlink import mavutil
 
 def pin_autopilot(m, secs):
@@ -115,17 +115,30 @@ if not vers:
     sys.exit("no AUTOPILOT_VERSION received")
 uids = [bytes(v.uid2[:12]).hex().upper() for v in vers]
 
+def inert(s):
+    """s with every C0 control (newline too), DEL and C1 control as \\xNN, so text
+    from the vehicle cannot move the cursor, recolour the terminal or start a line."""
+    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+
+
+bad_hash = False
 for ver in vers:
     fv = ver.flight_sw_version
-    gh = bytes(ver.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip()
+    raw = bytes(ver.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip()
+    gh = raw.lower()
+    # The hash ends up in a command to paste, so it must be hex and nothing else.
+    hash_ok = re.fullmatch('[0-9a-f]{7,40}', gh) is not None
+    bad_hash |= not hash_ok
     print(f"\nfirmware : {(fv>>24)&0xff}.{(fv>>16)&0xff}.{(fv>>8)&0xff}")
-    print(f"git hash : {gh}")
+    print(f"git hash : {gh if hash_ok else inert(raw) + ' (not a hex hash)'}")
     print(f"board    : {ver.board_version >> 16}")
     print(f"uid      : {bytes(ver.uid2[:12]).hex().upper()}")
 if len(vers) > 1:
     print(f"\nWARNING: {len(vers)} flight controllers answer as system {sysid} "
           f"component {compid} on this link (uids {', '.join(uids)}). "
           f"Give each its own system id (MAV_SYSID on 4.7, SYSID_THISMAV before 4.7).")
+    sys.exit(1)
+if bad_hash:
     sys.exit(1)
 print(f"\nTo pin a SITL worktree to exactly this build:")
 print(f"  git -C <your ardupilot checkout> fetch origin")

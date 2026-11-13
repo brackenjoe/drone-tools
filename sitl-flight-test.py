@@ -37,6 +37,37 @@ ap.add_argument('--device', default='tcp:127.0.0.1:5760',
                      'MAVProxy runs')
 a = ap.parse_args()
 
+
+def pin_autopilot(m, secs):
+    """The autopilot's heartbeat, not whichever arrives first: through a
+    router or on a shared link the first one may be a GCS's. None on timeout."""
+    end = time.time() + secs
+    while time.time() < end:
+        msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
+        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+            m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
+            return msg
+    return None
+
+
+def recv_from(m, types, sysid, compid, timeout, condition=None):
+    """recv_match that takes a message only from the pinned autopilot
+    (sysid, compid). A message from anyone else is skipped and the wait goes
+    on to its own deadline, so a foreign message neither ends the wait early
+    nor is taken as the answer. None on timeout."""
+    end = time.time() + timeout
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return None
+        msg = m.recv_match(type=types, blocking=True, timeout=left, condition=condition)
+        if msg is None:
+            return None
+        if msg.get_srcSystem() == sysid and msg.get_srcComponent() == compid:
+            return msg
+
+
 TGT = 10.0 if a.vehicle == 'copter' else 25.0
 
 try:
@@ -44,23 +75,40 @@ try:
 except OSError as e:
     sys.exit(f"FAIL: no heartbeat on {a.device}: cannot connect ({e})")
 print(f"waiting for heartbeat ({a.vehicle}) ...")
-if m.wait_heartbeat(timeout=60) is None:
+if pin_autopilot(m, 60) is None:
     sys.exit(f"FAIL: no heartbeat on {a.device}")
-print(f"  system {m.target_system}")
+SYS, COMP = m.target_system, m.target_component
+print(f"  system {SYS} component {COMP}")
+
+
+def rx(types, timeout):
+    """The next message of these types from the pinned autopilot only."""
+    return recv_from(m, types, SYS, COMP, timeout)
+
+
+def set_mode(num):
+    """DO_SET_MODE by number to the pinned autopilot: set_mode_apm would look
+    the name up by whatever heartbeat last set the link's vehicle type."""
+    m.mav.command_long_send(SYS, COMP, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, num,
+                            0, 0, 0, 0, 0)
+
+
+# ArduCopter and ArduPlane custom_mode numbers (Mode::Number in mode.h).
+MODES = {'copter': {'GUIDED': 4, 'LAND': 9}, 'plane': {'TAKEOFF': 13, 'RTL': 11}}[a.vehicle]
 
 # ArduPilot sends only HEARTBEAT until a GCS asks for streams.
-m.mav.request_data_stream_send(m.target_system, m.target_component,
+m.mav.request_data_stream_send(SYS, COMP,
                                mavutil.mavlink.MAV_DATA_STREAM_ALL, 5, 1)
 print("requested data streams")
 
 # This arms and takes off. Only a SITL has SIM_* parameters.
 pv = None
 for _ in range(3):
-    m.mav.param_request_read_send(m.target_system, m.target_component,
-                                  b'SIM_SPEEDUP', -1)
+    m.mav.param_request_read_send(SYS, COMP, b'SIM_SPEEDUP', -1)
     end = time.time() + 3
     while pv is None and time.time() < end:
-        got = m.recv_match(type='PARAM_VALUE', blocking=True, timeout=1)
+        got = rx('PARAM_VALUE', 1)
         if got is not None and got.param_id.rstrip('\x00') == 'SIM_SPEEDUP':
             pv = got
     if pv is not None:
@@ -74,7 +122,7 @@ print(f"  SITL confirmed (SIM_SPEEDUP = {pv.param_value:g})")
 print("waiting for GPS 3D fix (up to 120s)...")
 deadline = time.time() + 120
 while time.time() < deadline:
-    msg = m.recv_match(type='GPS_RAW_INT', blocking=True, timeout=5)
+    msg = rx('GPS_RAW_INT', 5)
     if msg and msg.fix_type >= 3:
         print(f"  3D fix, {msg.satellites_visible} sats")
         break
@@ -83,13 +131,20 @@ else:
 
 def cmd(c, *p):
     p = list(p) + [0]*(7-len(p))
-    m.mav.command_long_send(m.target_system, m.target_component, c, 0, *p)
-    return m.recv_match(type='COMMAND_ACK', blocking=True, timeout=10)
+    m.mav.command_long_send(SYS, COMP, c, 0, *p)
+    end = time.time() + 10
+    while time.time() < end:
+        ack = rx('COMMAND_ACK', end - time.time())
+        if ack is not None and ack.command == c:   # an ack for something else is not ours
+            return ack
+    return None
 
 mode = 'GUIDED' if a.vehicle == 'copter' else 'TAKEOFF'
-m.set_mode_apm(mode)
+set_mode(MODES[mode])
 time.sleep(1)
-hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=5)
+hb = rx('HEARTBEAT', 5)
+if hb is None:
+    sys.exit("FAIL: no heartbeat from the autopilot after the mode change")
 print(f"  mode = {mavutil.mode_string_v10(hb)}")
 
 print("arming (retrying while prearm settles)...")
@@ -111,7 +166,7 @@ else:
 peak = 0.0
 deadline = time.time() + 90
 while time.time() < deadline:
-    msg = m.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=5)
+    msg = rx('GLOBAL_POSITION_INT', 5)
     if not msg:
         continue
     alt = msg.relative_alt / 1000.0
@@ -124,11 +179,11 @@ else:
 
 if a.vehicle == 'copter':
     print("landing...")
-    m.set_mode_apm('LAND')
+    set_mode(MODES['LAND'])
     deadline = time.time() + 90
     height = peak
     while time.time() < deadline:
-        msg = m.recv_match(type=['HEARTBEAT', 'GLOBAL_POSITION_INT'], blocking=True, timeout=5)
+        msg = rx(['HEARTBEAT', 'GLOBAL_POSITION_INT'], 5)
         if msg is None:
             continue
         if msg.get_type() == 'GLOBAL_POSITION_INT':
@@ -139,7 +194,7 @@ if a.vehicle == 'copter':
     else:
         sys.exit(f"FAIL: still armed and airborne at {height:.1f}m at the landing timeout")
 else:
-    m.set_mode_apm('RTL')
+    set_mode(MODES['RTL'])
     print("  RTL set; climb proven")
 
 print(f"\nPASS: {a.vehicle} SITL flew.")

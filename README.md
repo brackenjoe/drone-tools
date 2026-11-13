@@ -287,10 +287,13 @@ headless machine. SITL's first serial port takes one TCP client, and
 MAVProxy running, point the tools at `tcp:127.0.0.1:5762` instead.
 `sitl-flight-test.py` arms and takes off, so it reads `SIM_SPEEDUP` back
 first and refuses, exit 2, when the parameter is absent: a real vehicle
-has none. No heartbeat is a failure at once. `ap-version.py` reads
+has none. It pins the first autopilot heartbeat and takes every reply,
+`SIM_SPEEDUP` and the arm ACK included, from that system and component
+only. No heartbeat is a failure at once. `ap-version.py` reads
 `AUTOPILOT_VERSION` and prints the version, the git hash, the board id (as
 the other tools' `--expect-board` takes it), the uid, and the
-`git worktree add` line that pins a tree to that hash.
+`git worktree add` line that pins a tree to that hash. A hash that is not
+hex is printed escaped, with no `git worktree add` line, and the exit is 1.
 
 ## mavftp-put.py
 
@@ -315,7 +318,10 @@ the remote file first, so a failed upload leaves the board without it; the
 failure message says so. `--verify-only` needs none of the `--expect-*`
 values. The default device is the first ArduPilot USB serial device, else
 `/dev/ttyACM0`. The selftest checks the CRC vector, the identity and armed
-decisions, and the retry and verify logic against a fake board.
+decisions, the retry and verify logic, and the FTP reply filter against
+a fake board. MAVFTP replies count only from the pinned system and
+component; two different CRC replies to one request are a failure, not a
+verdict.
 
 ## ap-mag-cal.py
 
@@ -349,8 +355,9 @@ as `ap-param-apply.py` does: the three `--expect-*` values must all match
 the board or nothing is sent, and a second board answering at the same
 system id is a refusal (a board answering after the 3 s window, or two
 boards with the same uid, is not caught). `start` and `accept` refuse while
-the vehicle is armed, judged from a fresh heartbeat just before the command
-and watched during the ACK wait and any re-send; no heartbeat in 3 s is
+the vehicle is armed, judged from a fresh heartbeat read after the
+preparatory reads, just before the command is sent, and watched during the
+ACK wait and any re-send; no heartbeat in 3 s is
 also a refusal. `cancel` is allowed while armed. `--log` receives
 everything printed, refusals included. The selftest covers the report
 formatting, the progress line, the message request and its fallback, the per-compass
@@ -386,8 +393,11 @@ already-running SITL quadplane or copter tailsitter in QHOVER only (no
 transitions, no mission): arm on the ground, climb to `--alt`, hands-off
 hold, yaw stick steps each way, then roll and pitch steps, each followed by
 centred sticks, then land. It refuses to arm anything without a
-`SIM_SPEEDUP` parameter, refuses to fly if any parameter in
-`--check-params` is missing or differs on the vehicle, lands and fails if
+`SIM_SPEEDUP` parameter (from the pinned autopilot only), refuses to arm if
+QHOVER is not confirmed, refuses a `--check-params` file with any line that
+is not `NAME VALUE` (or no parameter at all), refuses to fly if any of its
+parameters is missing or differs on the vehicle, removes an old
+`--phases-out` file before it starts, lands and fails if
 the climb does not reach `--alt` in time, and writes each phase's start
 and end in the vehicle's own boot time. The metrics tool
 reads the dataflash log, cuts it by those phases (or `--window`), and
@@ -412,7 +422,9 @@ Exit 0 ok; 1 refused, a read-back mismatch, a CLI error, or a backup
 written with firmware warnings; 2 no link or a timeout.
 
 `run` refuses `save`, `defaults`, `bl`, `dfu`, `exit`, `flash_erase`,
-`msc`, `motor`, `escprog`, `serialpassthrough` and `gpspassthrough`.
+`msc`, `motor`, `escprog`, `serialpassthrough`, `gpspassthrough`,
+`dshotprog` (programs the ESCs), `flash_write` (writes the flash chip, on
+builds with flash tools) and `dxw` (writes RAM; debug builds only).
 The Betaflight CLI edits a line before running it. It ends the line at a
 newline, drops other control characters, treats DEL as backspace,
 completes a command on `?` or tab, exits on Ctrl-D at the start of a line,
@@ -456,7 +468,7 @@ two print as `NOT_DISARMED|BADRX` and `DSHOT_TELEM|RPMFILTER`. An MSP error repl
 The checks run against 2026.6.2 SITL; the 26-flag table was read from
 Betaflight 4.5.3's source.
 
-`bf-cli-sitl-check.sh` is its test, 190 checks against Betaflight SITL (189
+`bf-cli-sitl-check.sh` is its test, 193 checks against Betaflight SITL (192
 without shellcheck; no hardware). It needs bash, python3 with pyserial, `setsid`, `pgrep` and `sha256sum`;
 `shellcheck` is used if installed. Build SITL in the repo directory and run:
 

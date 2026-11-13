@@ -35,6 +35,8 @@ Reads positions from nothing and prints none.
 """
 import argparse
 import json
+import os
+import re
 import sys
 
 np = None  # imported in main() after the arguments, so --help needs no numpy
@@ -42,8 +44,30 @@ np = None  # imported in main() after the arguments, so --help needs no numpy
 WANT = ('PARM', 'RATE', 'PIQY', 'PIDY', 'RCOU', 'RCIN', 'ATT', 'MOTB', 'MODE')
 
 
+def inert(s):
+    """s with every C0 control, DEL and C1 control as \\xNN, so a log or label
+    name cannot move the cursor, recolour the terminal or start a new line."""
+    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+
+
+def trapezoid(y, x):
+    """np.trapezoid (numpy 2.0+) or np.trapz (1.x); looked up per call because
+    numpy is imported late."""
+    return (getattr(np, 'trapezoid', None) or np.trapz)(y, x)
+
+
 def load_log(path):
     """(data, params): the WANT messages as lists of dicts, and PARM as a dict."""
+    # mavlink_connection dials tcp:/udpin: names before it tests for a file
+    if not os.path.isfile(path):
+        print(f"REFUSED: '{inert(path)}' is not an existing regular file", file=sys.stderr)
+        sys.exit(2)
+    # and it runs a file ending in .elf or under a bin/ directory as a child process
+    if not path.lower().endswith(('.bin', '.log')):
+        print(f"REFUSED: '{inert(path)}' is not a dataflash log (.bin or .log)", file=sys.stderr)
+        sys.exit(2)
+    if ':' in path:
+        path = os.path.abspath(path)
     from pymavlink import mavutil
     data = {k: [] for k in WANT}
     params = {}
@@ -194,7 +218,7 @@ def analyse(data, params, CW, CCW, phases=None, window=None, label=''):
         s = sel(t_att, (lo, hi))
         yaw_att = np.degrees(np.unwrap(np.radians(arr('ATT', 'Yaw')[s])))
         sr = sel(t_rate, (lo, hi))
-        integ = float(np.trapezoid(y[sr], t_rate[sr])) if sr.sum() > 1 else float('nan')
+        integ = float(trapezoid(y[sr], t_rate[sr])) if sr.sum() > 1 else float('nan')
         out['heading_hold'] = {
             'seconds': round(hi - lo, 1),
             'att_yaw_change_deg': float(yaw_att[-1] - yaw_att[0]) if s.sum() > 1 else None,
@@ -348,7 +372,7 @@ def print_report(out, name):
     pwm_lo, pwm_hi = out['pwm_thrust_range']
     track = out['yaw_tracking']
     steps, yo, sat = track['steps'], out['yaw_effort'], out['saturation']
-    print(f"{name}")
+    print(inert(name))
     print(f"  frame {out['frame']}, {PID}, RATE {out['log_rate_hz']} Hz, RCOU {out['rcou_hz']} Hz")
     print(f"  motors -> RCOU: {chan}; CW {CW}, CCW {CCW}; thrust PWM {pwm_lo:.0f}-{pwm_hi:.0f}")
     for w, v in out['windows_s'].items():
@@ -521,6 +545,55 @@ def selftest():
           abs(hold[0] - 12.0) < 0.1 and abs(hold[1] - 32.98) < 0.1)
     check(f"no phases: {n} RCOU rows, airborne window is the whole log",
           out['windows_s']['airborne'][0] == 0.0 and out['windows_s']['airborne'][1] > 32.9)
+    # a log path that names a connection must be refused, not dialled
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    for bad in ('tcp:127.0.0.1:1', 'udpin:127.0.0.1:1', '/nonexistent/x.bin'):
+        code = None
+        try:
+            with redirect_stderr(io.StringIO()):
+                load_log(bad)
+        except SystemExit as e:
+            code = e.code
+        except OSError:
+            code = 'dialled'
+        check(f"load_log refuses non-file '{bad}' with exit 2 ({code})", code == 2)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        exe = os.path.join(td, 'flight.elf')         # pymavlink would run this
+        with open(exe, 'w') as f:
+            f.write('#!/bin/sh\n')
+        os.chmod(exe, 0o700)
+        code = None
+        try:
+            with redirect_stderr(io.StringIO()):
+                load_log(exe)
+        except SystemExit as e:
+            code = e.code
+        check(f"load_log refuses a file that is not .bin/.log with exit 2 ({code})", code == 2)
+    buf = io.StringIO()
+    out = analyse(*synthetic(follow=1.0, split_on='YOut')[:2], [2, 3], [1, 4], None)
+    with redirect_stdout(buf):
+        print_report(out, 'x\x1b[31m\ny')
+    first = buf.getvalue().split('\n')[0]
+    check(f"print_report: label escapes are inert ({first!r})",
+          first == 'x\\x1b[31m\\x0ay')
+    real = getattr(np, 'trapezoid', None)
+    made = not hasattr(np, 'trapz')
+    try:
+        if real is not None:
+            del np.trapezoid
+        if made:
+            np.trapz = lambda y, x: float(np.sum((y[1:] + y[:-1]) * np.diff(x)) / 2)
+        v = float(trapezoid(np.array([0., 1., 2.]), np.array([0., 1., 2.])))
+        check(f"trapezoid falls back to np.trapz when np lacks trapezoid ({v})", v == 2.0)
+    except (AttributeError, TypeError) as e:
+        check(f"trapezoid fallback ({e})", False)
+    finally:
+        if real is not None:
+            np.trapezoid = real
+        if made and hasattr(np, 'trapz'):
+            del np.trapz
     print(f"{n_ok} passed, {n_bad} failed")
     return 0 if n_bad == 0 else 1
 

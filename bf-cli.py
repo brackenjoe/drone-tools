@@ -77,9 +77,10 @@ names), 30 the 2026.6.2 table, any other count (2025.12.1 has 29) prints `bit N`
 `$M!` error reply is exit 1.
 
 `run` refuses, before connecting, any line whose first word is save, defaults,
-bl, dfu, exit, flash_erase, msc, motor, escprog, serialpassthrough or
-gpspassthrough (they save, reboot, wipe, change mode, spin a motor or hand the
-link to an ESC or GPS), and any argument holding a character outside
+bl, dfu, exit, flash_erase, msc, motor, escprog, serialpassthrough,
+gpspassthrough, dshotprog, flash_write or dxw (they save, reboot, wipe, change
+mode, spin a motor, hand the link to an ESC or GPS, program the ESCs, or write
+flash or RAM), and any argument holding a character outside
 0x20-0x7e, a `?` or a `#`. The CLI's line editor ends a line at a newline or
 CR, exits on Ctrl-D at the start of a line, drops other bytes below 32, treats
 127 as backspace, completes on `?` and tab and cuts the line at `#`, so
@@ -104,9 +105,11 @@ PROMPT = b'\r\n# '
 ERROR_MARK = '###ERROR'
 # Commands `run` will not send: they save, reboot, wipe, change mode, drive a
 # motor or hand the link over (Betaflight 2026.6.2 cli.c: motor, escprog,
-# serialpassthrough, gpspassthrough).
+# serialpassthrough, gpspassthrough, dshotprog, flash_write, dxw, which writes
+# memory and exists only in debug builds).
 FORBIDDEN = {'save', 'defaults', 'bl', 'dfu', 'exit', 'flash_erase', 'msc',
-             'motor', 'escprog', 'serialpassthrough', 'gpspassthrough'}
+             'motor', 'escprog', 'serialpassthrough', 'gpspassthrough',
+             'dshotprog', 'flash_write', 'dxw'}
 # First words `diff all` emits (Betaflight 2026.6.2 cli.c printConfig). A restore
 # file may send only these; anything else refuses the whole restore.
 ALLOWED = {'set', 'feature', 'serial', 'aux', 'adjrange', 'rxrange', 'rxfail',
@@ -330,7 +333,7 @@ def save_old(cli, port, a, ver):
     if not ok:
         print("save did not report 'saving' and the link stayed up; nothing verified")
         return None
-    print(f"saved; board rebooting (firmware {ver} has no save noreboot)")
+    print(f"saved; board rebooting (firmware {inert(ver)} has no save noreboot)")
     try:
         cli.s.close()
     except Exception:
@@ -1007,8 +1010,13 @@ def u16(p, o):
     return p[o] | p[o + 1] << 8
 
 
+def inert_line(s):
+    """inert(s) with newline shown as \\x0a too, for a field that is one line."""
+    return inert(s).replace('\n', '\\x0a')
+
+
 def msp_text(b):
-    return inert(bytes(b).decode('latin-1'))
+    return inert_line(bytes(b).decode('latin-1'))
 
 
 def parse_fc_version(p):
@@ -1087,7 +1095,7 @@ def parse_boxes(names_payload, ids_payload):
     names = bytes(names_payload).decode('latin-1').split(';')
     if names and names[-1] == '':
         names.pop()
-    return dict(zip(ids_payload, names))
+    return dict(zip(ids_payload, (inert_line(n) for n in names)))
 
 
 def parse_mode_ranges(p, boxes):
@@ -1177,6 +1185,8 @@ def cmd_msp(a, ser=None, sleep=time.sleep):
         return 0
     except MspBad as e:
         raise NoLink(f"unusable MSP reply: {e}")
+    except (serial.SerialException, OSError) as e:
+        raise NoLink(f"serial link lost: {e}")
     except MspError as e:
         print(f"MSP ERROR: {e}")
         return 1
@@ -1396,6 +1406,11 @@ def selftest():
           parse_board_info(board(names=(b'T', b'A\x1bB', b'')), 46) == ('SH74', ''))
     check("board info: garbage identifier prints nothing", parse_board_info(b'\x00\x01\x02\x03' + b'\x00' * 20, 46) == ('', ''))
     boxes = parse_boxes(b'ARM;ANGLE;BEEPER;', bytes([0, 1, 13]))
+    hb = parse_boxes(b'A\x1b[2J;B\x9bX;C\x07;D\nE;', bytes([0, 1, 2, 3]))
+    check("boxnames: ESC, C1, BEL and LF are shown as \\xNN", hb == {0: 'A\\x1b[2J', 1: 'B\\x9bX', 2: 'C\\x07', 3: 'D\\x0aE'}, hb)
+    check("msp_text: LF in a craft name is shown as \\x0a", msp_text(b'a\nsample 9/9') == 'a\\x0asample 9/9', msp_text(b'a\nsample 9/9'))
+    check("run refuses dshotprog, flash_write and dxw",
+          all(refused(check_run_args, [c]) for c in ('dshotprog 0 1', 'flash_write 0 x', 'dxw 20000000 0')))
     check("boxnames zip boxids into permanent id -> name", boxes == {0: 'ARM', 1: 'ANGLE', 13: 'BEEPER'})
     mr = parse_mode_ranges(bytes([0, 0, 32, 48, 1, 2, 16, 32, 13, 2, 32, 48, 5, 3, 7, 7, 0, 0, 0, 0]), boxes)
     check("mode ranges: us = 900 + 25 x step, channel = aux + 5, start == end skipped",
@@ -1436,6 +1451,49 @@ def selftest():
           "sample 1/3: arming disabled: RXLOSS DSHOT_TELEM | rssi 714/1023 (70%) | rc 1500 1500 988 1500 988 2011 988" in o, o)
     check("msp summary counts flags and rc changes",
           "summary over 3 samples: RXLOSS 3/3, DSHOT_TELEM 3/3; rc frames changed in 1/2 intervals" in o, o)
+
+    class DyingWire(Wire):
+        """A link that drops (cable pulled, USB/IP detach) on the nth write."""
+        def __init__(self, answers, die_on, exc):
+            super().__init__(answers)
+            self.n, self.die_on, self.exc = 0, die_on, exc
+
+        def write(self, data):
+            self.n += 1
+            if self.n >= self.die_on:
+                raise self.exc('device disconnected')
+            super().write(data)
+
+    for die_on, exc in ((1, serial.SerialException), (4, OSError)):
+        dw = DyingWire(good_answers(), die_on, exc)
+        lrc, lo = run_msp(dw)
+        check(f"msp: {exc.__name__} on write {die_on} is the NO LINK path, exit 2",
+              lrc == 2 and "NO LINK" in lo and dw.closed, (lrc, lo))
+
+    class DyingRead(Wire):
+        def read(self, n=1):
+            raise serial.SerialException('read failed')
+
+    lrc, lo = run_msp(DyingRead(good_answers()))
+    check("msp: SerialException on read is exit 2", lrc == 2 and "NO LINK" in lo, (lrc, lo))
+
+    class SaveCli:
+        s = type('S', (), {'close': lambda self: None})()
+
+        def save_and_reboot(self):
+            return True, 'Saving'
+
+    real_reconnect = globals()['reconnect']
+    globals()['reconnect'] = lambda *args, **kw: SaveCli()
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            save_old(SaveCli(), 'p', argparse.Namespace(baud=1, timeout=1), '4.\x1b[2J\x07\x9b')
+    finally:
+        globals()['reconnect'] = real_reconnect
+    check("save_old: version token with ESC, BEL and C1 prints no raw control byte",
+          'saved; board rebooting (firmware 4.\\x1b[2J\\x07\\x9b' in buf.getvalue()
+          and not any(c in buf.getvalue() for c in '\x1b\x07\x9b'), buf.getvalue())
     check("msp modes now uses the last sample",
           "modes now (last sample): ARM ch5=988 off; ANGLE ch7=1000 off; BEEPER ch7=1000 off" in o, o)
     check("msp output has no raw ESC", '\x1b' not in o)

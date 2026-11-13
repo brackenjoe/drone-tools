@@ -25,8 +25,8 @@ means the script is gone. The failure message says so.
 
 So the board is pinned and identified before anything is touched, as
 ap-param-apply.py does. The system id and component id come from the first
-AUTOPILOT heartbeat (not a GCS's) and every other source is ignored. The
-upload needs --expect-uid (24 hex digits, AUTOPILOT_VERSION.uid2), --expect-git
+AUTOPILOT heartbeat (not a GCS's) and every other source is ignored, FTP replies
+included. The upload needs --expect-uid (24 hex digits, AUTOPILOT_VERSION.uid2), --expect-git
 (the firmware git hash, at least 8 hex digits, compared as an 8-character
 prefix) and --expect-board (the board id; ap-version.py prints all three); a
 mismatch refuses. It also listens 3 s for AUTOPILOT_VERSION and refuses if more
@@ -204,16 +204,62 @@ def refuse_if_armed(m, sysid, compid):
         sys.exit("REFUSED: the vehicle is armed")
 
 
+class PinnedLink:
+    """The link as MAVFTP sees it: everything delegates to the real link, but a
+    FILE_TRANSFER_PROTOCOL message is taken only from the pinned autopilot
+    (sysid, compid), as recv_from does for heartbeats. pymavlink's MAVFTP reads
+    through recv_match only and accepts a reply from any source. A foreign
+    message is dropped and the wait goes on to its own deadline; a
+    non-blocking read keeps reading past foreign messages and returns None
+    only when the queue is empty (or after FOREIGN_MAX foreign ones in a row,
+    so a flood cannot hold it)."""
+
+    FOREIGN_MAX = 1000
+
+    def __init__(self, link, sysid, compid):
+        self._link, self._sysid, self._compid = link, sysid, compid
+
+    def __getattr__(self, name):
+        return getattr(self._link, name)
+
+    def recv_match(self, condition=None, type=None, blocking=False, timeout=None):
+        end = None if timeout is None else time.time() + timeout
+        foreign = 0
+        while True:
+            left = None if end is None else max(0.0, end - time.time())
+            msg = self._link.recv_match(condition=condition, type=type,
+                                        blocking=blocking, timeout=left)
+            if msg is None:
+                return None
+            if (msg.get_type() != 'FILE_TRANSFER_PROTOCOL'
+                    or (msg.get_srcSystem() == self._sysid
+                        and msg.get_srcComponent() == self._compid)):
+                return msg
+            foreign += 1
+            if blocking:
+                if end is not None and time.time() >= end:
+                    return None
+            elif foreign >= self.FOREIGN_MAX:
+                return None
+
+
 class _CRCGrab(logging.Handler):
-    """cmd_crc only logs its result, so capture it off the log record."""
+    """cmd_crc only logs its result, so capture it off the log record. The
+    first value of a call stands; a second, different one sets `conflict`."""
     def __init__(self):
         super().__init__()
         self.value = None
+        self.conflict = None
 
     def emit(self, record):
         m = re.search(r'crc: .* (0x[0-9a-fA-F]{8})', record.getMessage())
-        if m:
-            self.value = int(m.group(1), 16)
+        if not m:
+            return
+        v = int(m.group(1), 16)
+        if self.value is None:
+            self.value = v
+        elif v != self.value and self.conflict is None:
+            self.conflict = v
 
 
 def remote_crc(ftp, path):
@@ -224,6 +270,10 @@ def remote_crc(ftp, path):
         ftp.cmd_crc([path])
     finally:
         root.removeHandler(grab)
+    if grab.conflict is not None:
+        print(f"  two different CRC replies came (0x{grab.value:08x} and 0x{grab.conflict:08x}); "
+              "not trusting either", file=sys.stderr)
+        return None
     return grab.value
 
 
@@ -591,6 +641,69 @@ def _selftest():
                 rc, _b = put(['empty'] * 2, retries=2)
             assert rc == 1 and GONE in err.getvalue(), err.getvalue()
 
+        @case("FTP link wrapper drops a foreign FILE_TRANSFER_PROTOCOL and passes the pinned one")
+        def _():
+            class Msg:
+                def __init__(self, t, sysid, compid):
+                    self.t, self.s, self.c = t, sysid, compid
+
+                def get_type(self):
+                    return self.t
+
+                def get_srcSystem(self):
+                    return self.s
+
+                def get_srcComponent(self):
+                    return self.c
+
+            class Link:
+                target_system = 1
+
+                def __init__(self, q):
+                    self.q = list(q)
+
+                def recv_match(self, condition=None, type=None, blocking=False, timeout=None):
+                    return self.q.pop(0) if self.q else None
+
+            evil, good = Msg('FILE_TRANSFER_PROTOCOL', 99, 7), Msg('FILE_TRANSFER_PROTOCOL', 1, 1)
+            hb = Msg('HEARTBEAT', 99, 7)
+            w = PinnedLink(Link([evil, good]), 1, 1)
+            assert w.target_system == 1                      # delegated
+            assert w.recv_match(type='FILE_TRANSFER_PROTOCOL', blocking=True, timeout=1) is good
+            assert PinnedLink(Link([evil]), 1, 1).recv_match(type='FILE_TRANSFER_PROTOCOL') is None
+            # a foreign message queued ahead of the pinned one must not hide it
+            assert PinnedLink(Link([evil, good]), 1, 1).recv_match(
+                type='FILE_TRANSFER_PROTOCOL') is good
+            # a flood of foreign ones ends in None, not a spin
+            fl = PinnedLink(Link([evil] * 5000 + [good]), 1, 1)
+            assert fl.recv_match(type='FILE_TRANSFER_PROTOCOL') is None
+            assert PinnedLink(Link([evil, evil]), 1, 1).recv_match(blocking=True, timeout=1) is None
+            assert PinnedLink(Link([hb]), 1, 1).recv_match() is hb   # only FTP is filtered
+
+        @case("two different CRC replies in one call: no verdict")
+        def _():
+            import contextlib
+            import io
+
+            class Two:
+                def __init__(self, vals):
+                    self.vals = vals
+
+                def cmd_crc(self, args):
+                    for v in self.vals:
+                        logging.getLogger().info("crc: %s 0x%08x in 0.1s", args[0], v)
+
+            root, old = info_logging()
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    assert remote_crc(Two([0, 0x43fc9a4d]), '/APM/x.lua') is None
+                assert 'two different CRC' in err.getvalue()
+                assert remote_crc(Two([0x43fc9a4d, 0x43fc9a4d]), '/APM/x.lua') == 0x43fc9a4d
+                assert remote_crc(Two([0x1234abcd]), '/APM/x.lua') == 0x1234abcd
+            finally:
+                root.setLevel(old)
+
     bad = results.count(False)
     print(f"\n{len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
@@ -675,7 +788,7 @@ def main():
         check_identity(m, a)
 
     def new_ftp():
-        return mavftp.MAVFTP(m, m.target_system, m.target_component)
+        return mavftp.MAVFTP(PinnedLink(m, sysid, compid), sysid, compid)
 
     if a.verify_only:
         got = remote_crc(new_ftp(), a.remote)

@@ -56,8 +56,8 @@ is not saved and lasts until the FC reboots.
 
 This writes to a flight controller: `start` begins a calibration and `accept`
 saves one. Both refuse while the vehicle is armed, judged from a fresh
-HEARTBEAT read just before the command is sent (REFUSED, nothing sent; no
-heartbeat in 3 s is also a refusal), and a heartbeat showing it armed while
+HEARTBEAT read just before the command is sent, after the preparatory reads
+(REFUSED, nothing sent; no heartbeat in 3 s is also a refusal), and a heartbeat showing it armed while
 the command waits for its ACK, resends included, stops the run (STOPPED; the
 command may already have been applied). `cancel` is allowed while armed.
 
@@ -146,6 +146,13 @@ def refuse_shared_sysid(uids, sysid, compid):
 def is_armed(hb):
     """True if a HEARTBEAT has the MAV_MODE_FLAG_SAFETY_ARMED bit set."""
     return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+
+def inert(s):
+    """s with every C0 control (newline too: one message stays one log line),
+    DEL and C1 control as \\xNN, so text from the vehicle cannot move the
+    cursor, recolour the terminal or forge a log line."""
+    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
 
 
 def armed_now(m, sysid, compid, window=3.0):
@@ -507,6 +514,66 @@ def selftest():
           sc(Link([[ack(42424, 0), ack(42425, 0, (9, 9))]]), True, tries=1) is None)
     check("send_command: no ACK in 3 tries -> None, 3 sends",
           (lambda l: (sc(l, True), l.sent))(Link([[], [], []])) == (None, 3))
+    # --- the armed re-check right before the command (a link that arms mid-run)
+    class Arming:
+        """A link whose first fresh heartbeat is disarmed and every later one
+        armed; it ACKs commands and answers parameter reads."""
+        def __init__(self):
+            self.beats, self.cmds, self.ack, self.param = 0, [], [], []
+            self.mav = NS(command_long_send=self.command_long_send,
+                          param_request_read_send=self.param_request_read_send,
+                          request_data_stream_send=lambda *a: None)
+
+        def command_long_send(self, sysid, compid, cmd, *rest):
+            self.cmds.append(cmd)
+            self.ack.append(NS(command=cmd, result=0, get_type=lambda: 'COMMAND_ACK',
+                               get_srcSystem=lambda: 1, get_srcComponent=lambda: 1))
+
+        def param_request_read_send(self, sysid, compid, name, idx):
+            self.param.append(NS(param_id=name.decode(), param_value=1.0,
+                                 get_srcSystem=lambda: 1, get_srcComponent=lambda: 1))
+
+        def recv_match(self, type=None, blocking=False, timeout=None, condition=None):
+            if type == 'HEARTBEAT' and blocking:
+                self.beats += 1
+                return hb(self.beats > 1)
+            if type == 'PARAM_VALUE' and self.param:
+                return self.param.pop(0)
+            if isinstance(type, list) and 'COMMAND_ACK' in type and self.ack:
+                return self.ack.pop(0)
+            return None
+
+    def arms_midway(cmd):
+        link = Arming()
+        try:
+            act(link, 1, 1, NS(cmd=cmd, timeout=1), lambda s: None)
+        except SystemExit as e:
+            return str(e), link.cmds
+        return None, link.cmds
+
+    for cmd, cid in (('accept', ACCEPT), ('start', START)):
+        why, sent = arms_midway(cmd)
+        check(f"{cmd}: armed after the first check -> REFUSED, command {cid} not sent",
+              str(why).startswith("REFUSED: the vehicle armed while") and cid not in sent)
+    why, sent = arms_midway('start')
+    check("start: the interval restore still goes out when it refuses",
+          sent.count(SET_MESSAGE_INTERVAL) >= 4)   # 2 to enable, 2 to restore
+
+    # --- peer text is inert, newline included
+    nasty = "a\x1b[2Jb\rc\nd\x07\x7f\x9bz"
+    check("inert: ESC CR LF BEL DEL and C1 escaped, nothing raw left",
+          inert(nasty) == "a\\x1b[2Jb\\x0dc\\x0ad\\x07\\x7f\\x9bz")
+    check("inert: plain text unchanged", inert("MagCal: No location") == "MagCal: No location")
+    said = []
+    link = Fake(fresh=[NS(get_type=lambda: 'STATUSTEXT', text=nasty,
+                          get_srcSystem=lambda: 1, get_srcComponent=lambda: 1)])
+    try:
+        watch(link, 1, 1, 0.3, said.append, lambda *a, **k: 0)
+    except SystemExit:
+        pass
+    check("watch: a STATUSTEXT with ESC CR LF is one inert line",
+          len(said) >= 1 and said[0].startswith("FC: a\\x1b") and "\n" not in said[0]
+          and "\x1b" not in said[0])
     print(f"{n_ok} passed, {n_bad} failed")
     return 0 if n_bad == 0 else 1
 
@@ -599,7 +666,7 @@ def run(a, say):
     if not vers:
         sys.exit("no AUTOPILOT_VERSION")
     for v in vers:
-        say(f"FC: git {bytes(v.flight_custom_version).decode('ascii', 'ignore').strip(chr(0)).strip()} "
+        say(f"FC: git {inert(bytes(v.flight_custom_version).decode('ascii', 'ignore').strip(chr(0)).strip())} "
             f"board {v.board_version >> 16} uid {bytes(v.uid2[:12]).hex().upper()} sysid {sysid}")
     refuse_shared_sysid([bytes(v.uid2[:12]).hex().upper() for v in vers], sysid, compid)
     ver = vers[0]
@@ -610,14 +677,24 @@ def run(a, say):
     if uid != a.expect_uid.upper():
         bad.append(f"uid {uid}")
     if not git.lower().startswith(a.expect_git.lower()[:8]):
-        bad.append(f"git {git}")
+        bad.append(f"git {inert(git)}")
     if board != a.expect_board:
         bad.append(f"board {board}")
     if bad:
         sys.exit("REFUSED, wrong flight controller: " + ', '.join(bad))
+    return act(m, sysid, compid, a, say)
 
+
+def act(m, sysid, compid, a, say):
+    """The command itself, on a link already pinned to the one FC."""
     def command(cmd, *params, guard=True):
         return send_command(m, sysid, compid, cmd, params, guard_armed=guard)
+
+    def refuse_if_armed_now(what):
+        """The last check before a command that writes: the reads before it
+        can take seconds, and the FC may have armed meanwhile."""
+        if armed_now(m, sysid, compid):
+            sys.exit(f"REFUSED: the vehicle armed while the tool was preparing; {what}")
 
     if a.cmd == 'cancel':
         res = command(CANCEL, guard=False)
@@ -631,6 +708,7 @@ def run(a, say):
 
     if a.cmd == 'accept':
         before = read_offsets(m, sysid, compid)
+        refuse_if_armed_now("nothing was sent")
         res = command(ACCEPT)
         say(f"accept: ACK result {res} (0 = accepted; it also says 0 when nothing was saved)")
         rc, lines = judge_accept(before, read_offsets(m, sysid, compid), res)
@@ -657,6 +735,7 @@ def run(a, say):
         + ("with SET_MESSAGE_INTERVAL (reset when this ends)" if mode == 'interval' else
            "with the EXTRA3 stream at 4 Hz (stays until the FC reboots)"))
     try:
+        refuse_if_armed_now("START not sent; the message intervals are reset")
         res = command(START, 0, 0, 0, 0, 0)
         say(f"start: ACK result {res} (0 = accepted); turn the vehicle through every orientation")
         if res != 0:
@@ -666,7 +745,8 @@ def run(a, say):
             f"FC reboots")
         return watch(m, sysid, compid, a.timeout, say, command)
     finally:
-        res = restore_mag_cal_messages(mode, command)
+        # unguarded: an armed vehicle must not turn the restore into a STOPPED
+        res = restore_mag_cal_messages(mode, lambda c, *p: command(c, *p, guard=False))
         if res:
             say(f"message intervals reset: ACK results {res} (0 = accepted)")
 
@@ -690,7 +770,7 @@ def watch(m, sysid, compid, timeout, say, command):
             say(f"started mask {msg.cal_mask:#05b}: compass {', '.join(map(str, on)) or 'none'} "
                 f"(mask 0 skips unhealthy and COMPASS_USEn=0 compasses)")
         if t == 'STATUSTEXT':
-            say(f"FC: {msg.text}")
+            say(f"FC: {inert(msg.text)}")
         elif t == 'MAG_CAL_PROGRESS':
             progress[msg.compass_id] = msg
             if time.time() - last_print >= 2:
