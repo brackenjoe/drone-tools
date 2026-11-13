@@ -108,7 +108,8 @@ def pin_autopilot(m, secs):
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
         if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
-                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS
+                and msg.get_srcSystem() != 0 and msg.get_srcComponent() != 0):  # 0 = broadcast
             m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
             return msg
     return None
@@ -262,7 +263,7 @@ class _CRCGrab(logging.Handler):
             self.conflict = v
 
 
-def remote_crc(ftp, path):
+def _crc_once(ftp, path):
     grab = _CRCGrab()
     root = logging.getLogger()
     root.addHandler(grab)
@@ -270,11 +271,23 @@ def remote_crc(ftp, path):
         ftp.cmd_crc([path])
     finally:
         root.removeHandler(grab)
-    if grab.conflict is not None:
-        print(f"  two different CRC replies came (0x{grab.value:08x} and 0x{grab.conflict:08x}); "
-              "not trusting either", file=sys.stderr)
-        return None
-    return grab.value
+    return grab
+
+
+def remote_crc(ftp, path):
+    """The board's CRC of `path`, or None. Two different values in one reply
+    window may be a stale duplicate, so ask once more (a fresh cmd_crc) and
+    accept only a second answer that carries exactly one value."""
+    grab = _crc_once(ftp, path)
+    if grab.conflict is None:
+        return grab.value
+    print(f"  two different CRC replies came (0x{grab.value:08x} and 0x{grab.conflict:08x}); "
+          "asking once more", file=sys.stderr)
+    again = _crc_once(ftp, path)
+    if again.conflict is None and again.value is not None:
+        return again.value
+    print("  the CRC is still not a single value; not trusting any", file=sys.stderr)
+    return None
 
 
 GONE = "the remote file was removed before the first attempt and is now missing or partial"
@@ -680,6 +693,44 @@ def _selftest():
             assert PinnedLink(Link([evil, evil]), 1, 1).recv_match(blocking=True, timeout=1) is None
             assert PinnedLink(Link([hb]), 1, 1).recv_match() is hb   # only FTP is filtered
 
+        @case("pin_autopilot skips a heartbeat from sysid 0 or compid 0")
+        def _():
+            global mavutil
+            # a stub with the two common.xml values the pin reads, so this runs
+            # without pymavlink as the other selftest cases do
+            class mu:
+                class mavlink:
+                    MAV_AUTOPILOT_INVALID, MAV_TYPE_GCS = 8, 6
+            old, mavutil = globals().get('mavutil'), mu
+
+            class HB:
+                autopilot, type = 3, 2
+
+                def __init__(self, s, c):
+                    self.s, self.c = s, c
+
+                def get_srcSystem(self):
+                    return self.s
+
+                def get_srcComponent(self):
+                    return self.c
+
+            class L:
+                def __init__(self, msgs):
+                    self.msgs = list(msgs)
+
+                def recv_match(self, **kw):
+                    return self.msgs.pop(0) if self.msgs else None
+
+            try:
+                good = HB(1, 1)
+                for bad in (HB(0, 1), HB(1, 0), HB(0, 0)):
+                    m = L([bad, good])
+                    assert pin_autopilot(m, 1) is good, (bad.s, bad.c)
+                    assert (m.target_system, m.target_component) == (1, 1)
+            finally:
+                mavutil = old
+
         @case("two different CRC replies in one call: no verdict")
         def _():
             import contextlib
@@ -699,6 +750,24 @@ def _selftest():
                 with contextlib.redirect_stderr(err):
                     assert remote_crc(Two([0, 0x43fc9a4d]), '/APM/x.lua') is None
                 assert 'two different CRC' in err.getvalue()
+
+                class Seq:
+                    def __init__(self, calls):
+                        self.calls, self.n = calls, 0
+
+                    def cmd_crc(self, args):
+                        vals, self.n = self.calls[self.n], self.n + 1
+                        for v in vals:
+                            logging.getLogger().info("crc: %s 0x%08x in 0.1s", args[0], v)
+
+                with contextlib.redirect_stderr(io.StringIO()):
+                    s1 = Seq([[0, 0x43fc9a4d], [0x43fc9a4d]])
+                    assert remote_crc(s1, '/x') == 0x43fc9a4d and s1.n == 2     # re-ask is clean
+                    s2 = Seq([[0, 0x43fc9a4d], [1, 2]])
+                    assert remote_crc(s2, '/x') is None and s2.n == 2           # conflict twice
+                    assert remote_crc(Seq([[0, 1], []]), '/x') is None          # re-ask silent
+                    s3 = Seq([[0x1234abcd]])
+                    assert remote_crc(s3, '/x') == 0x1234abcd and s3.n == 1     # no re-ask needed
                 assert remote_crc(Two([0x43fc9a4d, 0x43fc9a4d]), '/APM/x.lua') == 0x43fc9a4d
                 assert remote_crc(Two([0x1234abcd]), '/APM/x.lua') == 0x1234abcd
             finally:

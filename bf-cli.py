@@ -78,9 +78,9 @@ names), 30 the 2026.6.2 table, any other count (2025.12.1 has 29) prints `bit N`
 
 `run` refuses, before connecting, any line whose first word is save, defaults,
 bl, dfu, exit, flash_erase, msc, motor, escprog, serialpassthrough,
-gpspassthrough, dshotprog, flash_write or dxw (they save, reboot, wipe, change
-mode, spin a motor, hand the link to an ESC or GPS, program the ESCs, or write
-flash or RAM), and any argument holding a character outside
+gpspassthrough, dshotprog, flash_write, dxw or bind_rx (they save, reboot, wipe,
+change mode, spin a motor, hand the link to an ESC or GPS, program the ESCs,
+write flash or RAM, or put the receiver into bind mode, which can drop the RC link), and any argument holding a character outside
 0x20-0x7e, a `?` or a `#`. The CLI's line editor ends a line at a newline or
 CR, exits on Ctrl-D at the start of a line, drops other bytes below 32, treats
 127 as backspace, completes on `?` and tab and cuts the line at `#`, so
@@ -93,7 +93,7 @@ saves unless --save is given and never flashes. Needs pyserial;
 `socket://host:port` works as a port (Betaflight SITL serves the CLI on TCP
 5761, UART1).
 """
-import argparse, difflib, glob, os, re, sys, time
+import argparse, difflib, glob, os, re, sys, tempfile, time, unicodedata
 
 try:
     import serial
@@ -106,10 +106,11 @@ ERROR_MARK = '###ERROR'
 # Commands `run` will not send: they save, reboot, wipe, change mode, drive a
 # motor or hand the link over (Betaflight 2026.6.2 cli.c: motor, escprog,
 # serialpassthrough, gpspassthrough, dshotprog, flash_write, dxw, which writes
-# memory and exists only in debug builds).
+# memory and exists only in debug builds; bind_rx, cli.c ~:8274, puts an
+# SPI/SRXL2/CRSF receiver into bind mode, which can drop the RC link).
 FORBIDDEN = {'save', 'defaults', 'bl', 'dfu', 'exit', 'flash_erase', 'msc',
              'motor', 'escprog', 'serialpassthrough', 'gpspassthrough',
-             'dshotprog', 'flash_write', 'dxw'}
+             'dshotprog', 'flash_write', 'dxw', 'bind_rx'}
 # First words `diff all` emits (Betaflight 2026.6.2 cli.c printConfig). A restore
 # file may send only these; anything else refuses the whole restore.
 ALLOWED = {'set', 'feature', 'serial', 'aux', 'adjrange', 'rxrange', 'rxfail',
@@ -131,11 +132,21 @@ class Refused(Exception):
     pass
 
 
+def _inert_char(c):
+    o = ord(c)
+    if (o < 32 and c != '\n') or 0x7f <= o <= 0x9f:
+        return f'\\x{o:02x}'
+    if o > 0x9f and unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f'\\u{o:04x}'
+    return c
+
+
 def inert(s):
     """s with every C0 control except newline, DEL and every C1 control shown as
-    \\xNN, so text from the FC cannot drive the terminal it is printed to."""
-    return ''.join(f'\\x{ord(c):02x}' if (ord(c) < 32 and c != '\n') or 0x7f <= ord(c) <= 0x9f
-                   else c for c in s)
+    \\xNN, and every format character (bidi overrides, zero-width) and U+2028/9
+    as \\uXXXX, so text from the FC cannot drive or mislead the terminal it is
+    printed to."""
+    return ''.join(map(_inert_char, s))
 
 
 def sendable(line):
@@ -415,14 +426,14 @@ def utc_stamp():
     return time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
 
 
-def header(ident, port, what, warnings=()):
+def header(ident, port, what, warnings=(), notes=()):
     return [f"# {TOOL} {what}",
             f"# firmware: {inert(ident['version'])}",
             f"# board: {inert(ident['board'])}",
             f"# mcu: {inert(ident['mcu'])}",
             f"# craft_name: {inert(ident['craft']) or '-'}",
             f"# utc: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
-            f"# port: {port}"] + [f"# warning: firmware reported: {inert(w)}" for w in warnings]
+            f"# port: {port}"] + [f"# warning: firmware reported: {inert(w)}" for w in warnings] + [f"# warning: {n}" for n in notes]
 
 
 def safe(s):
@@ -441,14 +452,34 @@ def file_stem(ident, stamp):
 def flag_errors(out):
     """(text, errors): every firmware `###ERROR ...###` line kept in place but
     turned into a comment, so a later restore never sends it; errors is the list
-    of error texts (the line without its ### marks)."""
-    lines, errors = [], []
-    for ln in out.split('\n'):
+    of error texts (the line without its ### marks); rewritten is the set of
+    line indexes it turned into comments."""
+    lines, errors, rewritten = [], [], set()
+    for i, ln in enumerate(out.split('\n')):
         if ERROR_MARK in ln:
             errors.append(ln.strip().strip('#').strip())
             ln = f"# bf-cli: firmware reported: {inert(ln.strip())}"
+            rewritten.add(i)
         lines.append(ln)
-    return '\n'.join(lines), errors
+    return '\n'.join(lines), errors, rewritten
+
+
+def printable_ascii(ln):
+    return all(0x20 <= ord(c) <= 0x7e for c in ln)
+
+
+def flag_nonprintable(out, skip=frozenset()):
+    """(text, count): every line with a byte outside 0x20-0x7e becomes a comment
+    showing it through inert_line, so the file a later `cat` or restore reads
+    holds no control byte from the FC. skip holds the indexes flag_errors
+    rewrote (decided by index, never by text the FC could imitate)."""
+    lines, n = [], 0
+    for i, ln in enumerate(out.split('\n')):
+        if not printable_ascii(ln) and i not in skip:
+            n += 1
+            ln = f"# bf-cli: not backed up (non-printable bytes): {inert_line(ln)}"
+        lines.append(ln)
+    return '\n'.join(lines), n
 
 
 def stable_cmd(cli, line, tries=5):
@@ -475,19 +506,26 @@ def do_backup(cli, ident, port, outdir, dump):
     os.makedirs(outdir, exist_ok=True)
     base = file_stem(ident, utc_stamp())
     n = 0
-    while os.path.exists(os.path.join(outdir, base + '.diff')):
+    exts = ['.diff'] + (['.dump'] if dump else [])
+    while any(os.path.exists(os.path.join(outdir, base + e)) for e in exts):
         n += 1
         base = f"{base.rsplit('_dup', 1)[0]}_dup{n}"
     paths, warnings = [], []
     for cmdline, ext in [('diff all', '.diff')] + ([('dump all', '.dump')] if dump else []):
         out = stable_cmd(cli, cmdline)
-        out, errs = flag_errors(out)
+        out, errs, rewritten = flag_errors(out)
         warnings += errs
+        out, bad = flag_nonprintable(out, rewritten)
+        notes = [f"{bad} line(s) not backed up (non-printable bytes from the FC)"] if bad else []
+        warnings += notes
         if 'save' not in out.split('\n')[-3:] and ext == '.diff':
             raise Refused("`diff all` output did not end with `save`: truncated, not writing it")
         p = os.path.join(outdir, base + ext)
-        with open(p, 'w') as fh:
-            fh.write('\n'.join(header(ident, port, cmdline, errs)) + '\n\n' + out + '\n')
+        try:
+            with open(p, 'x') as fh:  # exclusive: never overwrite a file made since the name was picked
+                fh.write('\n'.join(header(ident, port, cmdline, errs, notes)) + '\n\n' + out + '\n')
+        except FileExistsError:
+            raise Refused(f"{p} appeared while backing up; not overwriting it")
         paths.append(p)
     return paths, warnings
 
@@ -1217,7 +1255,6 @@ def selftest():
         check(f"restore refuses {name}", refused(restore_lines, file_lines(text)))
         check(f"restore refuses {name} (alone)", refused(restore_lines, file_lines('set a = 1\n' + bad + '\n')))
     # a file read through read_file_header splits on \n only
-    import tempfile
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'x.diff')
         with open(p, 'w', encoding='utf-8', newline='') as fh:
@@ -1296,6 +1333,60 @@ def selftest():
     check("inert keeps newline and printable text", inert('a b\nc~') == 'a b\nc~')
     check("inert keeps non-ASCII above C1", inert('caf\xe9') == 'caf\xe9')
     check("inert escapes CR", inert('a\rb') == 'a\\x0db')
+    check("inert escapes U+202E and U+200B", inert('a\u202eb\u200bc') == 'a\\u202eb\\u200bc')
+    check("inert escapes U+2028, U+2029, U+FEFF, U+2066", inert('\u2028\u2029\ufeff\u2066') == '\\u2028\\u2029\\ufeff\\u2066')
+    check("inert_line escapes bidi and newline", inert_line('a\u202e\nb') == 'a\\u202e\\x0ab')
+    # backup body: non-printable lines commented, exclusive create
+    class BodyCli:
+        timeout = 1
+
+        def __init__(self, body):
+            self.body = body
+
+        def cmd(self, line, timeout=None):
+            return self.body
+    bident = {'version': '2026.6.2', 'board': 'S743', 'mcu': 'H743', 'craft': 'X', 'board_name': 'B'}
+    def slurp(path):
+        with open(path) as fh:
+            return fh.read()
+    clean = 'set a = 1\nset craft_name = X\nsave'
+    dirty = 'set a = 1\nset craft_name = A\x1b[2JB\x07C\x85D\nsave'
+    with tempfile.TemporaryDirectory() as td:
+        ps, ws = do_backup(BodyCli(clean), bident, 'p', td, False)
+        txt = slurp(ps[0])
+        check("backup: clean body kept verbatim, no warnings", 'set craft_name = X\n' in txt and not ws, ws)
+        ps, ws = do_backup(BodyCli(dirty), bident, 'p', td + '/d', True)
+        raw = slurp(ps[0])
+        check("backup: ESC/BEL/NEL line commented, no raw control byte, warning returned",
+              '# bf-cli: not backed up (non-printable bytes): set craft_name = A\\x1b[2JB\\x07C\\x85D' in raw
+              and not any(ord(c) < 32 and c != '\n' or 0x7f <= ord(c) <= 0x9f for c in raw)
+              and 'set a = 1\n' in raw and len(ws) == 2 and '# warning: 1 line(s) not backed up' in raw, (ws, raw))
+        check("backup: .dump gets the same treatment", len(ps) == 2 and '\x1b' not in slurp(ps[1]))
+        forged = 'set a = 1\n# bf-cli: firmware reported: \x1b[2J\x07pwn\nsave'
+        ps, ws = do_backup(BodyCli(forged), bident, 'p', td + '/f', False)
+        raw = slurp(ps[0])
+        check("backup: an FC line imitating the error-comment prefix is still commented",
+              bool('\x1b' not in raw and '\x07' not in raw and ws), (ws, raw))
+    with tempfile.TemporaryDirectory() as t2:
+        real_stamp, real_exists = globals()['utc_stamp'], os.path.exists
+        globals()['utc_stamp'] = lambda: 'T'
+        try:
+            first, _ = do_backup(BodyCli(clean), bident, 'p', t2, False)
+            with open(first[0], 'w') as fh:
+                fh.write('PRECIOUS')
+            second, _ = do_backup(BodyCli(clean), bident, 'p', t2, False)
+            os.path.exists = lambda path: False  # as if the file appeared after the name was picked
+            try:
+                raced = refused(do_backup, BodyCli(clean), bident, 'p', t2, False)
+            finally:
+                os.path.exists = real_exists
+        finally:
+            globals()['utc_stamp'] = real_stamp
+        check("backup: existing file kept, next backup gets a new name",
+              slurp(first[0]) == 'PRECIOUS' and second[0] != first[0])
+        check("backup: a file that appears after the name was picked is refused, not overwritten",
+              raced and slurp(first[0]) == 'PRECIOUS')
+    check("run refuses bind_rx", refused(check_run_args, ['get craft_name', 'bind_rx']))
     check("header writes craft, mcu, board, version through inert",
           '\x1b' not in ''.join(header({'version': '1\x1b', 'board': 'B\x07', 'mcu': 'M\x9b',
                                         'craft': 'C\x1b[2J'}, 'p', 'diff all')))

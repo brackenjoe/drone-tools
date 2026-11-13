@@ -46,7 +46,7 @@ of a dump, so there is nothing to compare.
 
 Offline. Reads files, talks to nothing.
 """
-import argparse, json, math, re, struct, sys
+import argparse, json, math, re, struct, sys, unicodedata
 
 ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
 ap.add_argument('pre', help='parameter dump from before the upgrade')
@@ -80,7 +80,16 @@ VOLATILE = ('STAT_BOOTCNT', 'STAT_RUNTIME', 'STAT_FLTTIME', 'STAT_RESET',
             'COMPASS_DEC')
 
 
-_CTRL = re.compile('[\x00-\x1f\x7f-\x9f]')
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
 
 
 def inert(s):
@@ -88,7 +97,7 @@ def inert(s):
     A parameter name comes from a file or a JSON map and can carry an escape
     sequence that a terminal would act on. Applied where text is printed, not
     where it is parsed, so the comparisons still see the real bytes."""
-    return _CTRL.sub(lambda m: '\\x%02x' % ord(m.group()), str(s))
+    return ''.join(map(_inert_char, str(s)))
 
 
 def load(path):

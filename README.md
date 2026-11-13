@@ -240,8 +240,9 @@ an older version can be shown to fail.
 The tools reach SITL through `mavlink-slowlink.py`: a 1800 B/s, 150 ms
 link, raised to 18,000 B/s (about a real USB/IP link's rate) for one case,
 and an unlimited one that drops chosen frames. Parameter reads and arming go to SITL
-directly, so every result is checked against what the board holds. What it
-covers:
+directly, so every result is checked against what the board holds. The proxy
+has no authentication and the newest client takes its slot, so keep `--bind`
+on loopback (it warns otherwise). What it covers:
 
 - `ap-ftp-get.py`: a listing that pages, a CRC-checked fetch, a burst reply
   dropped on purpose and fetched again, `--last-log`, and a rerun through
@@ -287,9 +288,12 @@ headless machine. SITL's first serial port takes one TCP client, and
 MAVProxy running, point the tools at `tcp:127.0.0.1:5762` instead.
 `sitl-flight-test.py` arms and takes off, so it reads `SIM_SPEEDUP` back
 first and refuses, exit 2, when the parameter is absent: a real vehicle
-has none. It pins the first autopilot heartbeat and takes every reply,
+has none, unless it runs one of ArduPilot's Sim-on-Hardware builds, which
+have `SIM_*` parameters and pass this check. It pins the first autopilot heartbeat and takes every reply,
 `SIM_SPEEDUP` and the arm ACK included, from that system and component
-only. No heartbeat is a failure at once. `ap-version.py` reads
+only, and it arms only after a heartbeat confirms the mode (GUIDED, or
+TAKEOFF on a plane): an unconfirmed mode is exit 1. No heartbeat is a
+failure at once. `ap-version.py` reads
 `AUTOPILOT_VERSION` and prints the version, the git hash, the board id (as
 the other tools' `--expect-board` takes it), the uid, and the
 `git worktree add` line that pins a tree to that hash. A hash that is not
@@ -320,8 +324,8 @@ values. The default device is the first ArduPilot USB serial device, else
 `/dev/ttyACM0`. The selftest checks the CRC vector, the identity and armed
 decisions, the retry and verify logic, and the FTP reply filter against
 a fake board. MAVFTP replies count only from the pinned system and
-component; two different CRC replies to one request are a failure, not a
-verdict.
+component. When one CRC request gets two different answers the tool asks
+once more and takes only a single clean answer; otherwise the attempt fails.
 
 ## ap-mag-cal.py
 
@@ -398,9 +402,10 @@ QHOVER is not confirmed, refuses a `--check-params` file with any line that
 is not `NAME VALUE` (or no parameter at all), refuses to fly if any of its
 parameters is missing or differs on the vehicle, removes an old
 `--phases-out` file before it starts, lands and fails if
-the climb does not reach `--alt` in time, and writes each phase's start
-and end in the vehicle's own boot time. The metrics tool
-reads the dataflash log, cuts it by those phases (or `--window`), and
+the climb does not reach `--alt` in time, and, only after a landing,
+writes each phase's start and end in the vehicle's own boot time. The
+metrics tool reads the dataflash log (`.bin`, or a text `.log`, opened as a
+log and never handed to pymavlink's connection logic), cuts it by those phases (or `--window`), and
 reports the yaw-rate tracking per step, the hands-off heading drift, the
 yaw controller's effort, motor saturation, and a regression of the
 CW-minus-CCW motor split (motors named by number as the props are built,
@@ -424,7 +429,8 @@ written with firmware warnings; 2 no link or a timeout.
 `run` refuses `save`, `defaults`, `bl`, `dfu`, `exit`, `flash_erase`,
 `msc`, `motor`, `escprog`, `serialpassthrough`, `gpspassthrough`,
 `dshotprog` (programs the ESCs), `flash_write` (writes the flash chip, on
-builds with flash tools) and `dxw` (writes RAM; debug builds only).
+builds with flash tools), `dxw` (writes RAM; debug builds only) and
+`bind_rx` (puts the receiver into bind mode, which can drop the RC link).
 The Betaflight CLI edits a line before running it. It ends the line at a
 newline, drops other control characters, treats DEL as backspace,
 completes a command on `?` or tab, exits on Ctrl-D at the start of a line,
@@ -443,7 +449,10 @@ from Betaflight 2026.6.2's source and measured on its SITL, not on a board;
 the cut at `#` was read from the source only. Older firmware was not
 checked, and a diff from another version may hold a command that is not on
 the list; it is then refused. Text from the board is printed, and written into
-backup headers, with control characters as `\xNN`. `bf-cli.py --selftest`
+backup headers, with control characters as `\xNN`. A backup line holding
+bytes that are not printable ASCII is not kept: it is written as a comment,
+and `backup` exits 1, as for a firmware error line (the backup `restore`
+takes first prints the warning and goes on). `bf-cli.py --selftest`
 runs the gate's cases offline.
 `restore` first backs up the current config beside the given file.
 On firmware before 2025.12 every command ends in a reboot, because `exit`
@@ -468,7 +477,7 @@ two print as `NOT_DISARMED|BADRX` and `DSHOT_TELEM|RPMFILTER`. An MSP error repl
 The checks run against 2026.6.2 SITL; the 26-flag table was read from
 Betaflight 4.5.3's source.
 
-`bf-cli-sitl-check.sh` is its test, 193 checks against Betaflight SITL (192
+`bf-cli-sitl-check.sh` is its test, 195 checks against Betaflight SITL (194
 without shellcheck; no hardware). It needs bash, python3 with pyserial, `setsid`, `pgrep` and `sha256sum`;
 `shellcheck` is used if installed. Build SITL in the repo directory and run:
 

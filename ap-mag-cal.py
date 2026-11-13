@@ -76,7 +76,7 @@ Usage (needs Python 3 and pymavlink >= 2.4.50):
       [--timeout 300] [--log cal.txt]
   python3 ap-mag-cal.py --selftest        no flight controller needed
 """
-import argparse, re, sys, time
+import argparse, math, re, sys, time, unicodedata
 
 mavutil = None  # imported in main() after the arguments, so --help needs no pymavlink
 
@@ -148,11 +148,30 @@ def is_armed(hb):
     return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
 
+def _inert_char(c):
+    if c <= '\x1f' or '\x7f' <= c <= '\x9f':
+        return f"\\x{ord(c):02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):   # bidi overrides, zero-width, U+2028/9
+        return f"\\u{ord(c):04x}"
+    return c
+
+
 def inert(s):
     """s with every C0 control (newline too: one message stays one log line),
-    DEL and C1 control as \\xNN, so text from the vehicle cannot move the
-    cursor, recolour the terminal or forge a log line."""
-    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+    DEL and C1 control as \\xNN, and every format or line/paragraph separator
+    character (bidi overrides, zero-width, U+2028/9) as \\uXXXX, so text from
+    the vehicle cannot move the cursor, recolour the terminal, forge a log
+    line or reorder what the operator reads."""
+    return ''.join(_inert_char(c) for c in str(s))
+
+
+def pin_autopilot(msg):
+    """True if a HEARTBEAT is a vehicle's autopilot to pin: not a GCS, not
+    MAV_AUTOPILOT_INVALID, and not from system or component 0 (the MAVLink
+    broadcast ids, which no vehicle has)."""
+    return bool(msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS
+                and msg.get_srcSystem() != 0 and msg.get_srcComponent() != 0)
 
 
 def armed_now(m, sysid, compid, window=3.0):
@@ -227,7 +246,8 @@ def judge_accept(before, after, ack):
     lines, changed = [], []
     for i in sorted(after):
         b, a = before.get(i), after[i]
-        if b is None or a is None:
+        if (b is None or a is None or not all(math.isfinite(v) for v in b)
+                or not all(math.isfinite(v) for v in a)):
             lines.append(f"  compass {i}: offsets not readable, cannot say")
         elif b != a:
             changed.append(i)
@@ -293,7 +313,7 @@ def format_report(msg):
 
 
 def all_reports_in(cal_mask, reports):
-    """True when every compass set in the report mask has reported."""
+    """True when every compass in the started mask (from MAG_CAL_PROGRESS) has reported."""
     return all((cal_mask >> i) & 1 == 0 or i in reports for i in range(8))
 
 
@@ -559,6 +579,25 @@ def selftest():
     check("start: the interval restore still goes out when it refuses",
           sent.count(SET_MESSAGE_INTERVAL) >= 4)   # 2 to enable, 2 to restore
 
+    # --- the vehicle arms during the SECOND interval request: still restored
+    class ArmsInEnable(Arming):
+        def command_long_send(self, sysid, compid, cmd, *rest):
+            super().command_long_send(sysid, compid, cmd, *rest)
+            if cmd == SET_MESSAGE_INTERVAL and self.cmds.count(cmd) == 2:
+                h = hb(True)
+                h.get_type = lambda: 'HEARTBEAT'
+                self.ack.insert(0, h)
+
+    link = ArmsInEnable()
+    try:
+        act(link, 1, 1, NS(cmd='start', timeout=1), lambda s: None)
+        why = None
+    except SystemExit as e:
+        why = str(e)
+    check("start: STOPPED during the second interval request still restores both intervals",
+          str(why).startswith("STOPPED: the FC armed") and START not in link.cmds
+          and link.cmds.count(SET_MESSAGE_INTERVAL) == 4)
+
     # --- peer text is inert, newline included
     nasty = "a\x1b[2Jb\rc\nd\x07\x7f\x9bz"
     check("inert: ESC CR LF BEL DEL and C1 escaped, nothing raw left",
@@ -574,6 +613,89 @@ def selftest():
     check("watch: a STATUSTEXT with ESC CR LF is one inert line",
           len(said) >= 1 and said[0].startswith("FC: a\\x1b") and "\n" not in said[0]
           and "\x1b" not in said[0])
+
+    # --- format, line and paragraph separators are escaped too
+    check("inert: U+202E and U+200B escaped as \\u202e and \\u200b",
+          inert("a\u202eb\u200bc") == "a\\u202eb\\u200bc")
+    check("inert: U+2028, U+2029, U+FEFF, U+2066 escaped; ordinary non-ASCII kept",
+          inert("\u2028\u2029\ufeff\u2066\u00e9\u4e2d") == "\\u2028\\u2029\\ufeff\\u2066\u00e9\u4e2d")
+    link = Fake(fresh=[NS(get_type=lambda: 'STATUSTEXT', text="x\u202ey\u200bz",
+                          get_srcSystem=lambda: 1, get_srcComponent=lambda: 1)])
+    said = []
+    try:
+        watch(link, 1, 1, 0.3, said.append, lambda *a, **k: 0)
+    except SystemExit:
+        pass
+    check("watch: a STATUSTEXT with U+202E and U+200B prints escaped",
+          said[:1] == ["FC: x\\u202ey\\u200bz"])
+
+    # --- broadcast ids are not a vehicle
+    def beat_of(sysid, compid, ap=3, typ=2):
+        return NS(autopilot=ap, type=typ, get_srcSystem=lambda: sysid,
+                  get_srcComponent=lambda: compid)
+
+    check("pin: ordinary autopilot heartbeat pinned", pin_autopilot(beat_of(1, 1)))
+    check("pin: system 0 heartbeat skipped", not pin_autopilot(beat_of(0, 1)))
+    check("pin: component 0 heartbeat skipped", not pin_autopilot(beat_of(1, 0)))
+    check("pin: 0/0 heartbeat skipped", not pin_autopilot(beat_of(0, 0)))
+    check("pin: GCS and MAV_AUTOPILOT_INVALID still skipped",
+          not pin_autopilot(beat_of(1, 1, typ=6)) and not pin_autopilot(beat_of(1, 1, ap=8)))
+
+    # --- accept: a non-finite offset is unreadable, not a change
+    nan = float('nan')
+    rc, ls = judge_accept({0: o1}, {0: (nan, 2.0, 3.0)}, 0)
+    check("accept: NaN offsets after -> not SAVED, exit 1, unreadable",
+          rc == 1 and ": SAVED" not in "\n".join(ls) and "not readable" in ls[0])
+    rc, ls = judge_accept({0: (nan, 2.0, 3.0)}, {0: o1}, 0)
+    check("accept: NaN offsets before -> not SAVED, exit 1", rc == 1 and ": SAVED" not in "\n".join(ls))
+    rc, ls = judge_accept({0: o1}, {0: (1.0, float('inf'), 3.0)}, 0)
+    check("accept: infinite offset -> not SAVED", rc == 1 and ": SAVED" not in "\n".join(ls))
+    rc, ls = judge_accept({0: (nan, nan, nan), 1: o1}, {0: (nan, nan, nan), 1: o2}, 0)
+    check("accept: NaN compass beside a real change -> only the real one saved",
+          rc == 0 and ls[-1] == "saved: compass 1")
+
+    # --- watch: the started mask is frozen, a report cannot shrink it
+    def mmsg(kind, cid, mask, status=4):
+        return NS(get_type=lambda: kind, compass_id=cid, cal_mask=mask, cal_status=status,
+                  attempt=1, completion_pct=10, autosaved=0, fitness=0.05, ofs_x=1.0,
+                  ofs_y=2.0, ofs_z=3.0, diag_x=1.0, diag_y=1.0, diag_z=1.0, offdiag_x=0.0,
+                  offdiag_y=0.0, offdiag_z=0.0, scale_factor=1.0, old_orientation=0,
+                  new_orientation=0, orientation_confidence=1.0,
+                  get_srcSystem=lambda: 1, get_srcComponent=lambda: 1)
+
+    def run_watch(msgs, timeout=0.5):
+        cancels, said = [], []
+        rc = watch(Fake(fresh=msgs), 1, 1, timeout, said.append,
+                   lambda c, *p, **k: cancels.append(c) or 0)
+        return rc, cancels, said
+
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b11), mmsg('MAG_CAL_PROGRESS', 1, 0b11),
+                                   mmsg('MAG_CAL_REPORT', 0, 0)])
+    check("watch: a mask-0 report with compass 1 unreported keeps waiting, times out, exit 3",
+          rc == 3 and cancels == [CANCEL] and not any("all reports in" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b11), mmsg('MAG_CAL_REPORT', 0, 0b11),
+                                   mmsg('MAG_CAL_REPORT', 1, 0)])
+    check("watch: every bit of the frozen mask reported -> all reports in, exit 0",
+          rc == 0 and cancels == [] and any("all reports in" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b01), mmsg('MAG_CAL_REPORT', 0, 0b11)])
+    check("watch: a report's wider mask does not widen the started mask",
+          rc == 0 and any("all reports in" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_REPORT', 0, 0)])
+    check("watch: a first REPORT with mask 0 does not end the wait (times out, exit 3)",
+          rc == 3 and cancels == [CANCEL] and not any("all reports in" in x for x in said)
+          and any("ignored MAG_CAL_REPORT" in x and "no MAG_CAL_PROGRESS yet" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_REPORT', 0, 0b01)])
+    check("watch: a report before any progress does not set the started mask",
+          rc == 3 and not any("started mask" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b01), mmsg('MAG_CAL_REPORT', 1, 0b11, status=1),
+                                   mmsg('MAG_CAL_REPORT', 1, 0b11, status=1), mmsg('MAG_CAL_REPORT', 0, 0b01)])
+    check("watch: an out-of-mask id is ignored (said once), not counted in the exit code",
+          rc == 0 and sum("ignored MAG_CAL_REPORT for compass 1" in x for x in said) == 1
+          and not any("REPORT compass 1" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0xff), mmsg('MAG_CAL_REPORT', 9, 0xff, status=1),
+                                   mmsg('MAG_CAL_REPORT', 0, 0xff)], timeout=0.5)
+    check("watch: compass id above 7 is ignored even with a full mask",
+          not any("REPORT compass 9" in x for x in said) and any("ignored MAG_CAL_REPORT for compass 9" in x for x in said))
     print(f"{n_ok} passed, {n_bad} failed")
     return 0 if n_bad == 0 else 1
 
@@ -653,8 +775,7 @@ def run(a, say):
     end, hb = time.time() + 30, None
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
-        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
-                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+        if pin_autopilot(msg):
             hb = msg
             break
     if hb is None:
@@ -730,11 +851,12 @@ def act(m, sysid, compid, a, say):
     def stream_seen():
         return recv_from(m, EXTRA3_PROOF, sysid, compid, 4) is not None
 
-    mode = enable_mag_cal_messages(command, request_stream, stream_seen)
-    say("progress and report requested "
-        + ("with SET_MESSAGE_INTERVAL (reset when this ends)" if mode == 'interval' else
-           "with the EXTRA3 stream at 4 Hz (stays until the FC reboots)"))
+    mode = 'interval'   # what restore sends if enabling is cut short
     try:
+        mode = enable_mag_cal_messages(command, request_stream, stream_seen)
+        say("progress and report requested "
+            + ("with SET_MESSAGE_INTERVAL (reset when this ends)" if mode == 'interval' else
+               "with the EXTRA3 stream at 4 Hz (stays until the FC reboots)"))
         refuse_if_armed_now("START not sent; the message intervals are reset")
         res = command(START, 0, 0, 0, 0, 0)
         say(f"start: ACK result {res} (0 = accepted); turn the vehicle through every orientation")
@@ -755,32 +877,43 @@ def watch(m, sysid, compid, timeout, say, command):
     """Print progress and reports until every started compass has reported or
     `timeout` s pass (then cancel). Exit code of the run."""
     t0, last_print, reports, mask_said = time.time(), 0.0, {}, False
-    progress, mask = {}, 0
+    progress, mask, ignored = {}, None, set()   # mask: frozen from the first PROGRESS only
     while time.time() - t0 < timeout:
         msg = recv_from(m, ['MAG_CAL_PROGRESS', 'MAG_CAL_REPORT', 'STATUSTEXT'],
                         sysid, compid, 1)
         if msg is None:
             continue
         t = msg.get_type()
-        if t != 'STATUSTEXT':
-            mask = msg.cal_mask
-        if t != 'STATUSTEXT' and not mask_said:
-            mask_said = True
-            on = [i for i in range(8) if (msg.cal_mask >> i) & 1]
-            say(f"started mask {msg.cal_mask:#05b}: compass {', '.join(map(str, on)) or 'none'} "
-                f"(mask 0 skips unhealthy and COMPASS_USEn=0 compasses)")
         if t == 'STATUSTEXT':
             say(f"FC: {inert(msg.text)}")
-        elif t == 'MAG_CAL_PROGRESS':
+            continue
+        if t == 'MAG_CAL_PROGRESS':
+            # the FC starts its calibrators one by one, so an early progress may not yet
+            # name them all: the started mask is the union of every progress mask
+            mask = msg.cal_mask | (mask or 0)
+        if mask is None or not 0 <= msg.compass_id <= 7 or not (mask >> msg.compass_id) & 1:
+            # a report before any progress, or for a compass that was not started, is not
+            # ours to trust: it would set or widen the mask the exit code is judged against
+            if (t, msg.compass_id) not in ignored:
+                ignored.add((t, msg.compass_id))
+                say(f"ignored {t} for compass {inert(str(msg.compass_id))}: "
+                    + ("no MAG_CAL_PROGRESS yet" if mask is None else "not in the started mask"))
+            continue
+        if not mask_said:
+            mask_said = True
+            on = [i for i in range(8) if (mask >> i) & 1]
+            say(f"started mask {mask:#05b}: compass {', '.join(map(str, on)) or 'none'} "
+                f"(mask 0 skips unhealthy and COMPASS_USEn=0 compasses)")
+        if t == 'MAG_CAL_PROGRESS':
             progress[msg.compass_id] = msg
             if time.time() - last_print >= 2:
                 last_print = time.time()
                 say(format_progress(mask, progress, reports))
-        elif t == 'MAG_CAL_REPORT' and msg.compass_id not in reports:
+        elif msg.compass_id not in reports:
             reports[msg.compass_id] = msg
             for line in format_report(msg):
                 say(line)
-            if all_reports_in(msg.cal_mask, reports):
+            if all_reports_in(mask, reports):
                 say("all reports in. Nothing saved to COMPASS_OFS_*: `accept` saves, `cancel` discards")
                 return 0 if all(r.cal_status == 4 for r in reports.values()) else 2
     say(f"timeout after {timeout:.0f} s: cancelling")

@@ -52,6 +52,7 @@ import argparse
 import difflib
 import re
 import sys
+import unicodedata
 
 NAME_RE = re.compile(r'^([a-z0-9_]+) = (.*)$')
 NUM = r'(-?[0-9]+(?:\.[0-9]+)?)'
@@ -67,10 +68,21 @@ SET_RE = re.compile(r'^set[ \t]+([a-z0-9_]+)[ \t]*=[ \t]?(.*)$')
 WS = ' \t'
 
 
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
+
+
 def inert(s):
     """s with every C0, DEL and C1 control character shown as \\xNN."""
-    return ''.join('\\x%02x' % ord(c) if ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f else c
-                   for c in s)
+    return ''.join(map(_inert_char, s))
 
 
 def split_lines(text):
@@ -549,6 +561,8 @@ save
     ereport = ebuf.getvalue()
     case('escape: ESC shown as \\x1b text in by-hand, profile and set value',
          ESC not in ereport and ereport.count('\\x1b') >= 5, repr(ereport))
+    case('escape: U+202E and U+200B (Cf) shown as \\uXXXX, ESC still \\x1b',
+         inert('a\u202eb\u200bc') == 'a\\u202eb\\u200bc' and inert(ESC) == '\\x1b')
     abuf = io.StringIO()
     run(cap + "z_q = 1\nAllowed range: 0 - 1" + ESC + "[2J\n",
         cap + "z_q = 1\nAllowed range: 0 - 2" + ESC + "[2J\n", None, abuf, io.StringIO())

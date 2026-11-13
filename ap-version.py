@@ -24,7 +24,7 @@ Usage:
   ap-version.py udp:0.0.0.0:14550     # a real vehicle over telemetry
   ap-version.py /dev/ttyACM0 --baud 115200
 """
-import re, sys, time, argparse
+import re, sys, time, argparse, unicodedata
 from pymavlink import mavutil
 
 def pin_autopilot(m, secs):
@@ -33,7 +33,8 @@ def pin_autopilot(m, secs):
     end = time.time() + secs
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
-        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+        if (msg and msg.get_srcSystem() and msg.get_srcComponent()   # 0 is broadcast, not a vehicle
+                and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
                 and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
             m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
             return msg
@@ -115,10 +116,22 @@ if not vers:
     sys.exit("no AUTOPILOT_VERSION received")
 uids = [bytes(v.uid2[:12]).hex().upper() for v in vers]
 
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
+
+
 def inert(s):
     """s with every C0 control (newline too), DEL and C1 control as \\xNN, so text
     from the vehicle cannot move the cursor, recolour the terminal or start a line."""
-    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+    return ''.join(map(_inert_char, str(s)))
 
 
 bad_hash = False

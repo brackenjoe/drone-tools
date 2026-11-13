@@ -45,7 +45,8 @@ def pin_autopilot(m, secs):
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
         if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
-                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS
+                and msg.get_srcSystem() != 0 and msg.get_srcComponent() != 0):  # 0 = broadcast id
             m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
             return msg
     return None
@@ -117,7 +118,7 @@ if pv is None:
     sys.stderr.write(f"REFUSED: {a.device} has no SIM_SPEEDUP parameter, so it is not a SITL. "
                      "This tool arms and takes off; it will not run against a real vehicle.\n")
     sys.exit(2)
-print(f"  SITL confirmed (SIM_SPEEDUP = {pv.param_value:g})")
+print(f"  SIM_SPEEDUP = {pv.param_value:g}: a SITL (or a Sim-on-Hardware build)")
 
 print("waiting for GPS 3D fix (up to 120s)...")
 deadline = time.time() + 120
@@ -140,11 +141,25 @@ def cmd(c, *p):
     return None
 
 mode = 'GUIDED' if a.vehicle == 'copter' else 'TAKEOFF'
-set_mode(MODES[mode])
-time.sleep(1)
-hb = rx('HEARTBEAT', 5)
+
+
+def confirm_mode(num, secs=6):
+    """Send the mode change and wait for the pinned autopilot's HEARTBEAT to
+    carry it: a command that was ignored must not be followed by an arm."""
+    end = time.time() + secs
+    while time.time() < end:
+        set_mode(num)
+        t = min(time.time() + 2, end)
+        while time.time() < t:
+            hb = rx('HEARTBEAT', max(t - time.time(), 0.1))
+            if hb is not None and hb.custom_mode == num:
+                return hb
+    return None
+
+
+hb = confirm_mode(MODES[mode])
 if hb is None:
-    sys.exit("FAIL: no heartbeat from the autopilot after the mode change")
+    sys.exit(f"FAIL: mode {mode} not confirmed; not arming")
 print(f"  mode = {mavutil.mode_string_v10(hb)}")
 
 print("arming (retrying while prearm settles)...")
@@ -179,7 +194,8 @@ else:
 
 if a.vehicle == 'copter':
     print("landing...")
-    set_mode(MODES['LAND'])
+    if confirm_mode(MODES['LAND']) is None:
+        print("  WARNING: mode LAND not confirmed")
     deadline = time.time() + 90
     height = peak
     while time.time() < deadline:
@@ -194,7 +210,9 @@ if a.vehicle == 'copter':
     else:
         sys.exit(f"FAIL: still armed and airborne at {height:.1f}m at the landing timeout")
 else:
-    set_mode(MODES['RTL'])
-    print("  RTL set; climb proven")
+    if confirm_mode(MODES['RTL']) is None:
+        print("  WARNING: mode RTL not confirmed; climb proven")
+    else:
+        print("  RTL set; climb proven")
 
 print(f"\nPASS: {a.vehicle} SITL flew.")

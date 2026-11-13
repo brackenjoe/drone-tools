@@ -36,6 +36,7 @@ import json
 import math
 import struct
 import sys
+import unicodedata
 from pathlib import Path
 
 HEAD1, HEAD2 = 0xA3, 0x95
@@ -68,6 +69,18 @@ FMT_CHAR = {
 }
 
 
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
+
+
 def inert(s) -> str:
     """Replace every C0 control, DEL and C1 control character by \\xNN.
 
@@ -75,9 +88,7 @@ def inert(s) -> str:
     sequence is interpreted by the reader's terminal. Applied where a string is
     printed or written, never at parse time.
     """
-    return "".join(
-        f"\\x{ord(c):02x}" if ord(c) <= 0x1F or 0x7F <= ord(c) <= 0x9F else c
-        for c in str(s))
+    return "".join(map(_inert_char, str(s)))
 
 
 _MD_SPECIAL = set("\\`|<>[]!*_#")
@@ -423,6 +434,8 @@ def selftest() -> int:
             check("pipe in a path cannot break the table row",
                   "old\\|x" in text and "old|x" not in text)
             check("escapes are written as \\xNN", "\\x1b" in out and "\\x9b" in out)
+        check("inert: U+202E and U+200B (Cf) come out as \\uXXXX, ESC still \\x1b",
+              inert('a\u202eb\u200bc') == 'a\\u202eb\\u200bc' and inert('\x1b') == '\\x1b')
 
         @case("a zero-length FMT definition terminates")
         def _():

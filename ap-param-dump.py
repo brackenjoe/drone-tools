@@ -54,7 +54,7 @@ written, with a loud line); 2 bad arguments.
 
 Read-only against the vehicle: it requests, it never sets or saves.
 """
-import argparse, glob, importlib.util, math, os, re, struct, sys, tempfile, time
+import argparse, glob, importlib.util, math, os, re, struct, sys, tempfile, time, unicodedata
 
 ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
 ap.add_argument('out', help='where to write the parameter values')
@@ -87,7 +87,8 @@ def pin_autopilot(m, secs):
     end = time.time() + secs
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
-        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+        if (msg and msg.get_srcSystem() and msg.get_srcComponent()   # 0 is broadcast, not a vehicle
+                and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
                 and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
             m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
             return msg
@@ -154,10 +155,22 @@ def find_device():
     sys.exit("no flight controller found; pass --device")
 
 
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
+
+
 def inert(s):
     """s with every C0 control, DEL and C1 control as \\xNN, so text from the
     vehicle cannot move the cursor, recolour the terminal or start a new line."""
-    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+    return ''.join(map(_inert_char, str(s)))
 
 
 _NAME_OK = re.compile(r'[A-Z0-9_]{1,16}\Z')

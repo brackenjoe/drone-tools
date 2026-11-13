@@ -12,8 +12,8 @@
 # Build the SITL once:  clone Betaflight at tag 2026.6.2, then `make TARGET=SITL`.
 # Run:                  BF_SITL=/path/to/betaflight_SITL.elf bf-cli-sitl-check.sh
 #                       (BF_SITL unset: ./betaflight/obj/main/betaflight_SITL.elf beside this script)
-# 193 checks (192 when shellcheck is not installed: that one is skipped, not
-# counted), 86 of them for the refusals and the restore allowlist (section
+# 195 checks (194 when shellcheck is not installed: that one is skipped, not
+# counted), 88 of them for the refusals and the restore allowlist (section
 # 9g). Exit status is the number of failed checks (0 = all passed), or 2 if
 # SITL could not be started. The SITL this script started is killed on exit.
 set -u
@@ -205,7 +205,7 @@ set horizon_level_strength = 125
 ###ERROR IN diff: CORRUPTED CONFIG: horizon_level_strength = 125###
 set d_min_roll = 46
 save"""
-text, errs = m.flag_errors(fixture)
+text, errs, _rewritten = m.flag_errors(fixture)
 ident = {'version': '4.5.1', 'board': 'SPEEDYBEEF405V4', 'mcu': 'STM32F4', 'craft': '< >', 'board_name': 'SPEEDYBEEF405V4'}
 hdr = '\n'.join(m.header(ident, 'p', 'diff all', errs))
 lines = text.split('\n')
@@ -216,7 +216,7 @@ chk('set line above it untouched', lines[2] == 'set horizon_level_strength = 125
 chk('one error returned (backup exits 1 on a non-empty list)', errs == ['ERROR IN diff: CORRUPTED CONFIG: horizon_level_strength = 125'])
 chk('header warning present', '# warning: firmware reported: ERROR IN diff: CORRUPTED CONFIG: horizon_level_strength = 125' in hdr)
 chk('header keeps craft verbatim', '# craft_name: < >' in hdr)
-chk('no error: text unchanged, no warnings', m.flag_errors('set a = 1\nsave') == ('set a = 1\nsave', []))
+chk('no error: text unchanged, no warnings', m.flag_errors('set a = 1\nsave')[:2] == ('set a = 1\nsave', []))
 send, _ = m.restore_lines(text.split('\n'))
 chk('restore never sends the comment, still sends the set line', send == ['set angle_p_gain = 125', 'set horizon_level_strength = 125', 'set d_min_roll = 46'])
 chk('craft "< >" names the file after the board', m.file_stem(ident, 'T').startswith('SPEEDYBEEF405V4_4.5.1_T'))
@@ -517,7 +517,7 @@ rs() { bf restore "$1" --expect-board SITL --expect-version "$want_version"; }  
 start_sitl
 
 # run: every FORBIDDEN word, refused before connecting
-for c in save defaults bl dfu exit flash_erase msc motor escprog serialpassthrough gpspassthrough; do
+for c in save defaults bl dfu exit flash_erase msc motor escprog serialpassthrough gpspassthrough bind_rx; do
     refused "run $c" 'is not sent by run' pre bf run "set craft_name = NEVER" "$c"
 done
 refused "run SAVE (upper case)" 'is not sent by run' pre bf run "SAVE"
@@ -561,7 +561,7 @@ probe R12 $'set craft_name = caf\xc3\xa9'
 refused 'restore non-ASCII' 'non-ASCII character' pre rs "$probe"
 
 # restore: forbidden first words, defaults and save variants, words a diff all never holds
-for c in bl dfu exit flash_erase msc 'motor 1 1000' escprog serialpassthrough gpspassthrough; do
+for c in bl dfu exit flash_erase msc 'motor 1 1000' escprog serialpassthrough gpspassthrough bind_rx; do
     probe F "set craft_name = NEVER" "$c"
     refused "restore file with '$c'" 'which restore will not send' pre rs "$probe"
 done

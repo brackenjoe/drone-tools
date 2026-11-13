@@ -205,7 +205,8 @@ def main():
     end, hb = time.time() + 30, None
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
-        if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+        if (msg and msg.get_srcSystem() and msg.get_srcComponent()   # 0 is broadcast, not a vehicle
+                and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
                 and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
             hb = msg
             break

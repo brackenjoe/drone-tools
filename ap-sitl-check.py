@@ -125,6 +125,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GIT = 'dbe79216'                      # ArduCopter 4.7.1
@@ -136,6 +137,23 @@ OP_LIST, OP_BURST, ACK = 3, 15, 128
 MSG_PARAM_REQUEST_READ, MSG_PARAM_SET = 20, 23
 PNAMES = [f'SERVO{n}_{f}' for n in range(9, 17) for f in ('MIN', 'MAX', 'TRIM')]
 TWO_BOARDS_PORT = 15822
+
+
+def _esc(c):
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}"
+    return c
+
+
+def inert(s):
+    """s with every C0 control, DEL and C1 control as \\xNN and every format (Cf),
+    line and paragraph separator character as \\uXXXX, so text from the vehicle
+    cannot move the cursor, recolour the terminal, reorder what is shown or start
+    a new line."""
+    return ''.join(map(_esc, str(s)))
 
 
 class StartError(Exception):
@@ -151,20 +169,20 @@ class Report:
     def check(self, name, cond, evidence='', detail=None):
         if cond:
             self.passed += 1
-            print(f"ok   {name}" + (f": {evidence}" if evidence else ''), flush=True)
+            print(f"ok   {name}" + (f": {inert(evidence)}" if evidence else ''), flush=True)
         else:
             self.failed += 1
-            print(f"FAIL {name}" + (f": {evidence}" if evidence else ''), flush=True)
+            print(f"FAIL {name}" + (f": {inert(evidence)}" if evidence else ''), flush=True)
             for line in (detail or []):
-                print(f"       | {line[:200]}", flush=True)
+                print(f"       | {inert(line[:200])}", flush=True)
         return bool(cond)
 
     def skip(self, name, why):
         self.skipped += 1
-        print(f"SKIP {name}: {why}", flush=True)
+        print(f"SKIP {inert(name)}: {inert(why)}", flush=True)
 
     def note(self, text):
-        print(f"     {text}", flush=True)
+        print(f"     {inert(text)}", flush=True)
 
 
 def tail(text, n=8):
@@ -1367,11 +1385,11 @@ def start_rig(args, rep, scratch):
     v = rig.truth.request(rig.truth.MAV.MAVLINK_MSG_ID_AUTOPILOT_VERSION, 'AUTOPILOT_VERSION')
     git = bytes(v.flight_custom_version).decode('ascii', 'ignore').strip('\x00').strip()
     fv = v.flight_sw_version
-    print(f"SITL: ArduCopter {(fv >> 24) & 0xff}.{(fv >> 16) & 0xff}.{(fv >> 8) & 0xff} git {git}, "
+    print(f"SITL: ArduCopter {(fv >> 24) & 0xff}.{(fv >> 16) & 0xff}.{(fv >> 8) & 0xff} git {inert(git)}, "
           f"system {rig.truth.sysid}; pymavlink {pymavlink.__version__}; python {sys.version.split()[0]}",
           flush=True)
     if not git.startswith(GIT):
-        raise StartError(f"the SITL reports git {git}, not {GIT} (ArduCopter 4.7.1)")
+        raise StartError(f"the SITL reports git {inert(git)}, not {GIT} (ArduCopter 4.7.1)")
     rig.truth_id = rig.truth.version()
     rig.uid, rig.board = rig.truth_id['uid'], str(rig.truth_id['board'])
     print(f"tools from {tools}", flush=True)
@@ -1448,7 +1466,7 @@ def main():
             run_group(rig, 'F5', case_f5)
             rig.link_clean('U/L/F5', [rig.slow])
         except StartError as e:
-            print(f"cannot run: {e}", file=sys.stderr, flush=True)
+            print(f"cannot run: {inert(e)}", file=sys.stderr, flush=True)
             status = 101
         finally:
             PROCS.stop_all()

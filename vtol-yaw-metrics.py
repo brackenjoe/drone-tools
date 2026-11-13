@@ -36,18 +36,30 @@ Reads positions from nothing and prints none.
 import argparse
 import json
 import os
-import re
 import sys
+import unicodedata
 
 np = None  # imported in main() after the arguments, so --help needs no numpy
 
 WANT = ('PARM', 'RATE', 'PIQY', 'PIDY', 'RCOU', 'RCIN', 'ATT', 'MOTB', 'MODE')
 
 
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
+
+
 def inert(s):
     """s with every C0 control, DEL and C1 control as \\xNN, so a log or label
     name cannot move the cursor, recolour the terminal or start a new line."""
-    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+    return ''.join(map(_inert_char, str(s)))
 
 
 def trapezoid(y, x):
@@ -58,20 +70,31 @@ def trapezoid(y, x):
 
 def load_log(path):
     """(data, params): the WANT messages as lists of dicts, and PARM as a dict."""
-    # mavlink_connection dials tcp:/udpin: names before it tests for a file
+    # not mavlink_connection: it dials tcp:/udpin: names before it tests for a
+    # file, and RUNS a file that is not a text log if its path ends .elf or
+    # contains /bin/ (mavchildexec; pymavlink 2.4.50). The DFReader classes
+    # only parse, so no path can execute or dial.
     if not os.path.isfile(path):
         print(f"REFUSED: '{inert(path)}' is not an existing regular file", file=sys.stderr)
         sys.exit(2)
-    # and it runs a file ending in .elf or under a bin/ directory as a child process
-    if not path.lower().endswith(('.bin', '.log')):
+    low = path.lower()
+    if not low.endswith(('.bin', '.log')):
         print(f"REFUSED: '{inert(path)}' is not a dataflash log (.bin or .log)", file=sys.stderr)
         sys.exit(2)
-    if ':' in path:
-        path = os.path.abspath(path)
-    from pymavlink import mavutil
+    from pymavlink import DFReader
+    if low.endswith('.bin'):
+        mlog = DFReader.DFReader_binary(path)
+    else:
+        try:
+            is_text = DFReader.DFReader_is_text_log(path)
+        except (OSError, UnicodeDecodeError):
+            is_text = False
+        if not is_text:
+            print(f"REFUSED: '{inert(path)}' is not a dataflash log (no FMT lines)", file=sys.stderr)
+            sys.exit(2)
+        mlog = DFReader.DFReader_text(path)
     data = {k: [] for k in WANT}
     params = {}
-    mlog = mavutil.mavlink_connection(path)
     while True:
         msg = mlog.recv_match(type=list(WANT))
         if msg is None:
@@ -571,6 +594,23 @@ def selftest():
         except SystemExit as e:
             code = e.code
         check(f"load_log refuses a file that is not .bin/.log with exit 2 ({code})", code == 2)
+    # a script under a bin/ directory must be refused or parsed, never run
+    with tempfile.TemporaryDirectory() as td:
+        os.mkdir(os.path.join(td, 'bin'))
+        marker = os.path.join(td, 'ran')
+        for name in ('x.log', 'x.bin'):
+            exe = os.path.join(td, 'bin', name)
+            with open(exe, 'w') as f:
+                f.write(f'#!/bin/sh\ntouch {marker}\n')
+            os.chmod(exe, 0o700)
+            code = None
+            try:
+                with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                    load_log(exe)
+            except SystemExit as e:
+                code = e.code
+            check(f"load_log does not execute bin/{name} (exit {code}, marker {'present' if os.path.exists(marker) else 'absent'})",
+                  not os.path.exists(marker) and (name != 'x.log' or code == 2))
     buf = io.StringIO()
     out = analyse(*synthetic(follow=1.0, split_on='YOut')[:2], [2, 3], [1, 4], None)
     with redirect_stdout(buf):
@@ -578,6 +618,8 @@ def selftest():
     first = buf.getvalue().split('\n')[0]
     check(f"print_report: label escapes are inert ({first!r})",
           first == 'x\\x1b[31m\\x0ay')
+    check("inert: U+202E and U+200B (Cf) come out as \\uXXXX, ESC still \\x1b",
+          inert('a\u202eb\u200bc') == 'a\\u202eb\\u200bc' and inert('\x1b') == '\\x1b')
     real = getattr(np, 'trapezoid', None)
     made = not hasattr(np, 'trapz')
     try:

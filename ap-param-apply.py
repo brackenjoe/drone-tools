@@ -52,7 +52,7 @@ mavutil.add_message, when a link switches from MAVLink 1 to 2; fixed in 2.4.50):
   ... write ... --log writes.tsv a.param b.param
   ... reboot tcp:127.0.0.1:5760 --expect-uid ... --expect-git ... --expect-board ...
 """
-import argparse, fnmatch, os, re, struct, sys, time
+import argparse, fnmatch, math, os, re, struct, sys, time
 
 mavutil = None  # imported in main() after the arguments, so --help needs no pymavlink
 
@@ -100,12 +100,18 @@ def read_files(paths):
                 if len(parts) != 2:
                     sys.exit(f"{p}:{n}: cannot parse {raw.rstrip()!r}")
                 name, sval = parts
-                if len(name) > 16 or not name.replace('_', '').isalnum() or name.upper() != name:
+                if not re.fullmatch(r'[A-Z0-9_]{1,16}', name):
                     sys.exit(f"{p}:{n}: not a parameter name: {name!r}")
                 try:
                     val = float(sval)
                 except ValueError:
                     sys.exit(f"{p}:{n}: not a number: {sval!r}")
+                if not math.isfinite(val):
+                    sys.exit(f"{p}:{n}: {name} value is not finite: {sval!r}")
+                try:
+                    struct.pack('<f', val)
+                except OverflowError:
+                    sys.exit(f"{p}:{n}: {name} value does not fit a float32: {sval!r}")
                 if name not in vals:
                     order.append(name)
                 vals[name] = (val, p)
@@ -171,7 +177,8 @@ class FC:
         end, hb = time.time() + 30, None
         while time.time() < end:
             msg = self.m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
-            if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+            if (msg and msg.get_srcSystem() and msg.get_srcComponent()   # 0 is broadcast, not a vehicle
+                    and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
                     and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
                 hb = msg
                 break

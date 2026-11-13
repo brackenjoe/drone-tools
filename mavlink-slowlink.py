@@ -19,6 +19,9 @@ replies for the next one. What the tool sends goes to EVERY upstream after
 --latency, whole frame by whole frame, with no rate limit. Defaults: rate
 unlimited, latency 0.
 
+The proxy has no authentication and the newest client takes the slot, so
+--bind must stay on loopback (main() warns on stderr otherwise).
+
 Frames pass byte for byte; the CRC and signature are not checked. Bytes that
 are not inside a frame are forwarded as they are and counted as junk. Rate
 pacing may split a frame across TCP sends. Frames from two upstreams are
@@ -51,7 +54,12 @@ before the latency), `dropped` as (direction, frame), `counts` as
 {('up'|'down', msgid): n} for every whole frame seen, dropped or not,
 `bytes_up` bytes received from the tool, `bytes_down` bytes delivered to the
 client, `junk` bytes outside any frame, both directions, `max_buffered`,
-`buffered`. `reset_records()` clears them, not the buffers.
+`buffered`. The per-frame lists (`sent_up`, `dropped`) stop growing at
+`record_cap` entries (100000), as do `counts` (distinct keys) and `errors`;
+`records_truncated` is then True. A key already in `counts` keeps counting; a
+new one past the cap is dropped. The tool-to-flight-controller latency queue
+is held to UPQ_CAP bytes (16 MiB); past it the client's frames are dropped
+and noted in `errors`. `reset_records()` clears the records, not the buffers.
 `ftp_fields(payload)` unpacks a FILE_TRANSFER_PROTOCOL (110) payload.
 
 `--selftest` runs the offline tests on loopback and exits with the number
@@ -59,6 +67,8 @@ failed.
 """
 import argparse
 import collections
+import ipaddress
+import math
 import re
 import signal
 import socket
@@ -70,6 +80,8 @@ import time
 Frame = collections.namedtuple('Frame', 'version sysid compid msgid payload upstream raw t')
 
 _MAGIC = re.compile(b'[\xfd\xfe]')
+RECORD_CAP = 100000     # records kept (sent_up, dropped, counts keys, errors), each
+UPQ_CAP = 16 << 20      # bytes the client may have queued toward the flight controllers
 TICK = 0.005            # pacer and latency-queue poll interval, s
 
 
@@ -154,6 +166,13 @@ def _hostport(u):
     return host, port
 
 
+def _is_loopback(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == 'localhost'
+
+
 def _close(s):
     for fn in (lambda: s.shutdown(socket.SHUT_RDWR), s.close):
         try:
@@ -173,6 +192,9 @@ class SlowLink:
             raise SlowLinkError("no upstream")
         self.rate = float(rate) if rate else None
         self.latency = float(latency or 0.0)
+        for name, val in (('rate', self.rate), ('latency', self.latency)):
+            if val is not None and not (math.isfinite(val) and val >= 0):
+                raise ValueError(f"{name} must be a finite number >= 0")
         self.drop = drop
         self.bind = bind
         self.port = None            # the bound listen port, once started
@@ -187,9 +209,11 @@ class SlowLink:
         self._threads = []
         self._down = collections.deque()    # [t_monotonic, bytes, offset]
         self._upq = collections.deque()     # (t_monotonic, bytes)
+        self._upq_bytes = 0
         self._buffered = 0
         self._sent = 0
         self._max_buffered = 0
+        self.record_cap = RECORD_CAP
         self._reset()
         self.errors = []
 
@@ -197,6 +221,7 @@ class SlowLink:
     def _reset(self):
         self._sent_up, self._dropped, self._counts = [], [], {}
         self._bytes_up = self._bytes_down = self._junk = 0
+        self._truncated = False
 
     def reset_records(self):
         with self._lock:
@@ -209,8 +234,38 @@ class SlowLink:
     bytes_up = property(lambda s: s._bytes_up)
     bytes_down = property(lambda s: s._bytes_down)
     junk = property(lambda s: s._junk)
+    records_truncated = property(lambda s: s._truncated)
     max_buffered = property(lambda s: s._max_buffered)
     buffered = property(lambda s: s._buffered)
+
+    def _record(self, lst, item):
+        """Append to a per-frame record unless it is full. Caller holds the lock."""
+        if len(lst) < self.record_cap:
+            lst.append(item)
+        else:
+            self._truncated = True
+
+    def _count(self, k):
+        """Count a frame. A new key past record_cap is dropped. Caller holds the lock."""
+        if k in self._counts or len(self._counts) < self.record_cap:
+            self._counts[k] = self._counts.get(k, 0) + 1
+        else:
+            self._truncated = True
+
+    def _enqueue_up(self, now, data):
+        """Queue client bytes toward the flight controllers, or drop them past UPQ_CAP.
+        Caller holds the lock."""
+        if self._upq_bytes + len(data) > UPQ_CAP:
+            self._note_error_locked(f"up queue over {UPQ_CAP} bytes: dropped {len(data)} bytes from the client")
+            return
+        self._upq.append((now, data))
+        self._upq_bytes += len(data)
+
+    def _note_error_locked(self, msg):
+        if len(self.errors) < self.record_cap:
+            self.errors.append(msg)
+        else:
+            self._truncated = True
 
     def _copy(self, name, kind):
         with self._lock:
@@ -280,7 +335,7 @@ class SlowLink:
     # -- helpers
     def _note_error(self, msg):
         with self._lock:
-            self.errors.append(msg)
+            self._note_error_locked(msg)
 
     def _should_drop(self, direction, frame):
         fn = self.drop
@@ -322,10 +377,12 @@ class SlowLink:
                     _close(conn)
                     return
                 self._client = conn
+                self._threads = [x for x in self._threads if x.is_alive()]
             self._log('client connected')
             t = threading.Thread(target=self._client_reader, args=(conn,), daemon=True)
-            self._threads.append(t)
-            t.start()
+            t.start()           # started before it is listed, so stop() never joins an unstarted thread
+            with self._lock:
+                self._threads.append(t)
 
     def _client_reader(self, conn):
         parser = FrameParser(None)
@@ -347,18 +404,17 @@ class SlowLink:
         if isinstance(item, bytes):
             with self._lock:
                 self._junk += len(item)
-                self._upq.append((now, item))
+                self._enqueue_up(now, item)
             return
         with self._lock:
-            k = ('up', item.msgid)
-            self._counts[k] = self._counts.get(k, 0) + 1
+            self._count(('up', item.msgid))
         if self._should_drop('up', item):
             with self._lock:
-                self._dropped.append(('up', item))
+                self._record(self._dropped, ('up', item))
             return
         with self._lock:
-            self._sent_up.append(item)
-            self._upq.append((now, item.raw))
+            self._record(self._sent_up, item)
+            self._enqueue_up(now, item.raw)
 
     def _up_reader(self, i, sock):
         parser = FrameParser(i)
@@ -382,11 +438,10 @@ class SlowLink:
                 self._enqueue_down(now, item)
             return
         with self._lock:
-            k = ('down', item.msgid)
-            self._counts[k] = self._counts.get(k, 0) + 1
+            self._count(('down', item.msgid))
         if self._should_drop('down', item):
             with self._lock:
-                self._dropped.append(('down', item))
+                self._record(self._dropped, ('down', item))
             return
         with self._lock:
             self._enqueue_down(now, item.raw)
@@ -405,6 +460,7 @@ class SlowLink:
                     if not (self._upq and self._upq[0][0] + self.latency <= time.monotonic()):
                         break
                     _, data = self._upq.popleft()
+                    self._upq_bytes -= len(data)
                 for i, s in enumerate(self._ups):
                     try:
                         s.sendall(data)
@@ -866,6 +922,111 @@ def _selftest():
         assert r.returncode == 2 and len(r.stderr.strip().splitlines()) == 1 and 'Traceback' not in r.stderr, r.stderr
         fc.close()
 
+    @case("per-frame records stop at record_cap and say so; counts keep counting; reset clears the flag")
+    def _():
+        with rig() as (link, (fc,)):
+            link.record_cap = 5
+            link.drop = lambda d, f: d == 'down' and f.msgid == 33
+            c = link.client()
+            assert _until(lambda: link.stats()['client'])
+            assert not link.records_truncated
+            c.send(b''.join(_frame(76, bytes([i + 1]), seq=i) for i in range(12)))
+            assert _until(lambda: link.counts.get(('up', 76)) == 12)
+            assert len(link.sent_up) == 5 and link.records_truncated
+            assert [f.payload for f in link.sent_up] == [bytes([i + 1]) for i in range(5)]
+            fc.send(b''.join(_frame(33, bytes([i + 1]), seq=i) for i in range(9)))
+            assert _until(lambda: link.counts.get(('down', 33)) == 9)
+            assert len(link.dropped) == 5 and link.counts[('down', 33)] == 9
+            link.reset_records()
+            assert not link.records_truncated and link.sent_up == []
+            c.send(_frame(76, b'\x01'))
+            assert _until(lambda: len(link.sent_up) == 1) and not link.records_truncated
+
+    @case("counts keys and errors stop at record_cap and say so; known keys keep counting")
+    def _():
+        with rig() as (link, (fc,)):
+            link.record_cap = 3
+            c = link.client()
+            assert _until(lambda: link.stats()['client'])
+            c.send(b''.join(_frame(m, b'x') for m in (10, 11, 12, 13, 14, 10, 10)))
+            assert _until(lambda: link.counts.get(('up', 10)) == 3)
+            assert len(link.counts) == 3 and link.records_truncated, link.counts
+            link.reset_records()
+            assert not link.records_truncated
+            link.drop = lambda d, f: 1 / 0
+            c.send(b''.join(_frame(20, b'x') for _ in range(8)))
+            assert _until(lambda: len(link.errors) == 3)
+            time.sleep(0.1)
+            assert len(link.errors) == 3 and link.records_truncated
+
+    @case("the up queue is capped in bytes: past it the client's frames are dropped and noted")
+    def _():
+        global UPQ_CAP
+        old, UPQ_CAP = UPQ_CAP, 100
+        try:
+            with rig(latency=30) as (link, (fc,)):
+                c = link.client()
+                assert _until(lambda: link.stats()['client'])
+                fr = _frame(76, b'x' * 20)
+                c.send(fr * 10)
+                assert _until(lambda: link.counts.get(('up', 76)) == 10)
+                assert link._upq_bytes <= 100 and any('up queue' in e for e in link.errors), link._upq_bytes
+        finally:
+            UPQ_CAP = old
+
+    @case("SlowLink() refuses a negative or non-finite rate or latency")
+    def _():
+        for kw in ({'rate': -1}, {'rate': float('nan')}, {'rate': float('inf')},
+                   {'latency': -0.5}, {'latency': float('nan')}, {'latency': float('inf')}):
+            try:
+                SlowLink(0, ['127.0.0.1:1'], **kw)
+            except ValueError:
+                continue
+            raise AssertionError(f"accepted {kw}")
+
+    @case("finished client reader threads are pruned from _threads on accept")
+    def _():
+        with rig() as (link, _fcs):
+            for _ in range(8):
+                link.client().close()
+                time.sleep(0.05)
+            c = link.client()
+            assert _until(lambda: link.stats()['client'])
+            assert _until(lambda: len(link._threads) <= 6), len(link._threads)
+            c.close()
+
+    @case("CLI: --rate and --latency must be finite and >= 0; a non-loopback --bind warns on stderr")
+    def _():
+        me = os.path.abspath(__file__)
+        for flag, val in (('--rate', '-1'), ('--rate', 'nan'), ('--rate', 'inf'),
+                          ('--latency', '-0.5'), ('--latency', 'nan'), ('--latency', 'inf')):
+            r = subprocess.run([sys.executable, me, '1', '127.0.0.1:1', flag, val],
+                               check=False, capture_output=True, text=True, timeout=10)
+            assert r.returncode == 2 and flag in r.stderr and 'Traceback' not in r.stderr, (flag, val, r.stderr)
+        fc = _FakeFC()
+        # the warning's decision, without binding every interface in a test
+        # documentation-only addresses (RFC 5737), built from parts so no literal
+        # address sits in the published file
+        TEST_NET_1, TEST_NET_2 = '.'.join(('192', '0', '2', '1')), '.'.join(('198', '51', '100', '1'))
+        for host, loop in (('127.0.0.1', True), ('localhost', True), ('::1', True),
+                           (TEST_NET_2, False), (TEST_NET_1, False)):
+            assert _is_loopback(host) == loop, host
+        for bind, warns in (('127.0.0.1', False),):
+            p = subprocess.Popen([sys.executable, me, str(_free_port()), fc.addr, '--bind', bind],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                assert p.stdout.readline().strip() == 'up'
+                p.send_signal(signal.SIGTERM)
+                p.wait(5)
+                err = p.stderr.read()
+                assert ('no authentication' in err) == warns, (bind, err)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                p.stdout.close()
+                p.stderr.close()
+        fc.close()
+
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
     return bad
@@ -887,6 +1048,12 @@ def main(argv=None):
         return _selftest()
     if a.listen_port is None or not a.upstream:
         ap.error('LISTEN_PORT and at least one UPSTREAM are required')
+    for flag, val in (('--rate', a.rate), ('--latency', a.latency)):
+        if val is not None and not (math.isfinite(val) and val >= 0):
+            ap.error(f'{flag} must be a finite number >= 0')
+    if not _is_loopback(a.bind):
+        print(f"mavlink-slowlink.py: warning: --bind {a.bind} is not loopback and the proxy has no "
+              f"authentication; anyone who can reach it can take the link", file=sys.stderr, flush=True)
 
     def say(msg):
         print(msg, flush=True)

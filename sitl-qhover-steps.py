@@ -50,6 +50,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 # ArduPlane/mode.h at Plane-4.7.1 (dbe79216), read from the tree.
 MODE = {'QSTABILIZE': 17, 'QHOVER': 18, 'QLOITER': 19, 'QLAND': 20}
@@ -95,7 +96,8 @@ def pin_autopilot(m, secs):
     while time.time() < end:
         msg = m.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
         if (msg and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
-                and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+                and msg.type != mavutil.mavlink.MAV_TYPE_GCS
+                and msg.get_srcSystem() != 0 and msg.get_srcComponent() != 0):  # 0 = broadcast id
             m.target_system, m.target_component = msg.get_srcSystem(), msg.get_srcComponent()
             return msg
     return None
@@ -119,10 +121,17 @@ def recv_from(m, types, sysid, compid, timeout, condition=None):
 
 
 def inert(s):
-    """s with every C0 control (newline too), DEL and C1 control as \\xNN, so
+    """s with every C0 control (newline too), DEL and C1 control as \\xNN, and
+    every format, line or paragraph separator character as \\uXXXX, so
     text from the vehicle cannot move the cursor, recolour the terminal or
     start a new line."""
-    return re.sub('[\x00-\x1f\x7f-\x9f]', lambda c: f"\\x{ord(c.group()):02x}", str(s))
+    def esc(c):
+        cat = unicodedata.category(c)
+        if cat == 'Cc':
+            return f"\\x{ord(c):02x}"
+        # Cf (bidi overrides, zero-width, soft hyphen), Zl, Zp: invisible too
+        return f"\\u{ord(c):04x}" if cat in ('Cf', 'Zl', 'Zp') else c
+    return ''.join(esc(c) for c in str(s))
 
 
 def parse_param_file(path):
@@ -162,7 +171,9 @@ def parse_param_file(path):
 
 
 # Files are read, and a stale phases file removed, before connecting, so a bad
-# file or a failed run leaves nothing for vtol-yaw-metrics.py to pick up.
+# file or a failed run leaves nothing for vtol-yaw-metrics.py to pick up. A
+# phases file is written only after a landing and a disarm, and only when every
+# phase has a start and end time; the landing-timeout path writes none.
 PARAM_FILES = [(path, parse_param_file(path)) for path in a.check_params]
 if a.phases_out and not a.params_only:
     try:
@@ -229,7 +240,7 @@ if sim_speedup is None:
                      "SITL. This tool arms and flies; it will not run against a real "
                      "vehicle.\n")
     sys.exit(2)
-print(f"SITL confirmed (SIM_SPEEDUP = {sim_speedup:g})", flush=True)
+print(f"SIM_SPEEDUP = {sim_speedup:g}: a SITL (or a Sim-on-Hardware build)", flush=True)
 
 bad = []
 for path, wanted in PARAM_FILES:
@@ -418,7 +429,10 @@ m.mav.rc_channels_override_send(SYS, COMP, 0, 0, 0, 0, 0, 0, 0, 0)
 print(f"\npeak |plane roll or yaw rate| over MAVLink ATTITUDE: "
       f"{peak['yaw_rate_dps']:.0f} deg/s",
       flush=True)
-if a.phases_out:
+if a.phases_out and landed:
+    if any(ph['start_ms'] is None or ph['end_ms'] is None for ph in phases):
+        sys.exit("FAIL: a phase has no start or end time (no SYSTEM_TIME seen); "
+                 "not writing --phases-out")
     with open(a.phases_out, 'w') as fh:
         json.dump({'airframe': airframe, 'phases': phases,
                    'sticks': {'yaw_step_pwm': Y, 'rp_step_pwm': R}},

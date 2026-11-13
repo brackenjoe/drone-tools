@@ -49,7 +49,7 @@ Needs pymavlink for the command line: pip install 'pymavlink>=2.4.50'
 (2.4.49 can crash at connect, a TypeError in mavutil.add_message, when a link
 switches from MAVLink 1 to 2; fixed in 2.4.50).
 """
-import argparse, glob, os, struct, sys, time
+import argparse, glob, os, struct, sys, time, unicodedata
 
 # opcodes, GCS_FTP.h FTP_OP
 OP_TERM, OP_RESET, OP_LIST, OP_OPEN_RO, OP_CRC, OP_BURST = 1, 2, 3, 4, 14, 15
@@ -59,11 +59,22 @@ CH = 239  # bytes of data per FILE_TRANSFER_PROTOCOL reply
 MAX_BYTES = 2 << 30  # default cap on one download
 
 
+def _inert_char(c):
+    """One character, or its escape: C0/DEL/C1 as \\xNN; format (Cf), line and
+    paragraph separator (Zl, Zp) characters as \\uXXXX, so a bidi override or a
+    zero-width character cannot reorder or hide text."""
+    o = ord(c)
+    if o < 0x20 or 0x7f <= o <= 0x9f:
+        return f"\\x{o:02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):
+        return f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}"
+    return c
+
+
 def inert(s):
     """`s` with every C0 control, DEL and C1 control character shown as \\xNN
     (lowercase hex), so text from the vehicle cannot drive the terminal."""
-    return ''.join('\\x%02x' % ord(c) if ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f else c
-                   for c in s)
+    return ''.join(map(_inert_char, s))
 
 
 class FtpError(Exception):
@@ -698,6 +709,8 @@ def _selftest():
         assert inert('a\x1b[2K\x07\rb') == 'a\\x1b[2K\\x07\\x0db'
         assert inert('\x7f\x85\x9f') == '\\x7f\\x85\\x9f'
         assert inert('plain \u00e9 text') == 'plain \u00e9 text'
+        assert inert('a\u202eb\u200bc') == 'a\\u202eb\\u200bc'
+        assert inert('\u2028\u2029') == '\\u2028\\u2029'
 
     @case("wait_autopilot skips GCS and gimbal heartbeats and pins the autopilot's system and component")
     def _():
@@ -725,6 +738,10 @@ def _selftest():
         c2 = _Conn()
         c2.q = [_HB(255, 190, MAV_AUTOPILOT_INVALID)]
         assert wait_autopilot(c2, 0.3) is None
+        c3 = _Conn()    # broadcast ids 0/0 are not a vehicle; the real autopilot follows
+        c3.q = [_HB(0, 0, 3), _HB(0, 1, 3), _HB(1, 0, 3), _HB(1, 1, 3)]
+        assert wait_autopilot(c3, 2) is not None and (c3.target_system, c3.target_component) == (1, 1), \
+            (c3.target_system, c3.target_component)
 
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
@@ -757,6 +774,8 @@ def wait_autopilot(m, timeout):
         if hb is None:
             continue
         if hb.autopilot == MAV_AUTOPILOT_INVALID:
+            continue
+        if not hb.get_srcSystem() or not hb.get_srcComponent():   # 0 is broadcast, not a vehicle
             continue
         if m.target_system not in (0, hb.get_srcSystem()):
             continue
