@@ -6,7 +6,8 @@ file (`sitl.sh` is one bash file), except that `ap-param-dump.py` needs
 `ap-sitl-check.py`, the test of the tools that talk to an ArduPilot board,
 needs `mavlink-slowlink.py` beside it. Clone the repo and run a tool
 with `python3`, for example `python3 log-fmt-diff.py OLD.BIN NEW.BIN`.
-Tested on Linux.
+Tested on Linux. `lua/` holds an ArduPilot Lua script, which runs on the
+flight controller, not here.
 
 ## Requirements
 
@@ -21,6 +22,8 @@ is bundled here:
 | `numpy>=1.26` | `vtol-yaw-metrics.py` | [numpy/numpy](https://github.com/numpy/numpy) | BSD-3-Clause |
 
     pip install -r requirements.txt
+
+`lua5.3` runs the Lua script's test.
 
 Use pymavlink 2.4.50 or later: 2.4.49 can crash at connect with a
 `TypeError` in `mavutil.add_message` when a link switches from MAVLink 1
@@ -49,6 +52,9 @@ to 2 (fixed upstream in 2.4.50).
 | `vtol-yaw-metrics.py` | Yaw-authority metrics off a hover log: does the yaw rate follow its demand, how far does heading drift hands-off, how hard is the yaw controller working, are the motors saturating, and what the CW-minus-CCW motor split answers to (yaw, roll or pitch demand), with the motors named by number as the props are built. `--selftest` runs on synthetic rows. | pymavlink, numpy |
 | `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. `msp` reads why the board will not arm over MSP, without entering the CLI. | `pyserial` |
 | `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing`, `invalid` or `unchecked`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
+| `test-fc-sender-checks.py` | Offline test that `ap-version.py`, `ap-param-dump.py`, `ap-param-apply.py`, `ap-mag-cal.py`, `ap-heading-watch.py`, `mavftp-put.py`, `sitl-flight-test.py` and `sitl-qhover-steps.py` take replies only from the autopilot they pinned (see below). | pymavlink |
+| `test-param-dump-health.py` | Offline test of `ap-param-dump.py --health` and its parameter-file writer against a fake autopilot that sends hostile data (see below). | pymavlink |
+| `lua/gazer_daynight.lua` | ArduPilot Lua script for a Caddx Gazer camera: makes a two-position RC switch select day or night outright, although the camera's input only toggles (see below). | ArduPilot 4.6 or 4.7 with scripting |
 
 Without `--device` or `--port`, `ap-ftp-get.py`, `ap-param-dump.py`,
 `mavftp-put.py` and `bf-cli.py` look in `/dev/serial/by-id` (Linux only);
@@ -588,6 +594,54 @@ What it does not do:
   app keeps behind a fingerprint. It authorises every device except
   keyboards and other input devices, network adapters, Bluetooth and,
   for now, audio. Its README has the details.
+
+## Offline tests: test-fc-sender-checks.py, test-param-dump-health.py
+
+    python3 test-fc-sender-checks.py      # 46 cases, about 5 minutes
+    python3 test-param-dump-health.py     # 8 cases
+
+Each case runs one tool as a subprocess against a fake MAVLink peer on
+loopback, so neither test needs a board or SITL. In most cases the fake
+sends, alongside the real reply from the autopilot (system 1, component 1),
+a forged one from another component or another system, and the case
+checks that the tool shows the real value, or refuses; the pin cases send
+an autopilot-looking heartbeat from (0,0) first. A tool that does not check the
+sender shows the forged value. The cases also cover a vehicle that arms
+partway through a write, a missing heartbeat after a write, and text from
+the vehicle carrying terminal escapes or newlines. `test-param-dump-health.py`
+checks that the health file holds no position unless `--health-position`
+is given (it looks for the field names and never prints a value), and that
+a bad parameter name or a NaN value is refused without touching an
+existing file. Both take `--tools DIR` to run the same cases against
+another copy of the tools, which is how to show that a case fails on a
+version without the check. Each prints PASS or FAIL per case and
+`N passed, M failed`, and exits 1 on any failure.
+
+## lua/gazer_daynight.lua
+
+The Caddx Gazer's day/night input is a trigger: each pulse switches the
+camera to the mode it is not in, and there is no command for "day" or for
+"night". Wiring an RC switch to it through a relay therefore never gives a
+switch position that means one mode. The camera also powers up in day
+mode every time; it does not remember night across a power cycle. The
+script keeps its own model of the camera's mode, compares it with the
+switch, and sends one pulse when they disagree. By default it also follows
+the camera's power rail on relay instance 3 (RELAY4): while the rail is off
+the model is held at day, and when it comes on the script waits for the
+camera to boot before bringing it to the switch position.
+
+Built and measured on a TBS Lucid H7 with the day/night pad on output M9,
+ArduCopter 4.6.3 and 4.7.1. The channel, the relay instances and the
+timings are in the tuning block at the top of the script; the header has
+the parameters to set and what was measured. If the camera's power has no
+relay, set `RAIL_RELAY = -1`: otherwise the script reads the rail as off,
+holds day and never pulses, silently. Copy it to `APM/scripts/` on
+the board's SD card and reboot.
+
+    lua5.3 lua/gazer_daynight_test.lua     # stubbed ArduPilot environment
+
+The test is for Lua 5.3, the version ArduPilot uses; 5.4 accepts syntax
+that 5.3 rejects.
 
 ## Licence
 
