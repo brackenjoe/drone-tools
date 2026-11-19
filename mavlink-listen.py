@@ -17,9 +17,16 @@ Modes:
         (src/endpoint.cpp, UdpEndpoint::_read_msg), so if the probe arrived,
         the flight controller's stream comes back.
 
-Prints the autopilot's HEARTBEAT fields (CRC checked against CRC_EXTRA 50)
-and a count per message id. Payloads other than HEARTBEAT are never decoded
-or printed: a stream carries positions.
+An autopilot heartbeat here is a HEARTBEAT that passes its CRC check
+(CRC_EXTRA 50) and whose autopilot field is not 8 (MAV_AUTOPILOT_INVALID,
+a GCS or companion). Prints the first one's fields, then, once the
+--seconds window ends, a summary line and a count per message id. The
+summary gives "N autopilot heartbeats, M armed", M being those with
+MAV_MODE_FLAG_SAFETY_ARMED (base_mode bit 128) set, 0 when none, so a
+script can check every autopilot heartbeat in the window, not just the
+first; heartbeats that fail the CRC are counted on the same line.
+Payloads other than HEARTBEAT are never decoded or printed: a stream
+carries positions.
 
 Exit 0 when an autopilot heartbeat was seen, or with --expect-none when
 nothing at all came back; 1 otherwise; 2 on a usage or connection error
@@ -56,6 +63,7 @@ class Parser:
         self.counts = {}
         self.first_hb = None
         self.hb = 0
+        self.armed_hb = 0
         self.bad_hb_crc = 0
         self.junk = 0
         self.sources = {}
@@ -102,6 +110,8 @@ class Parser:
         if ap == 8:          # a GCS or companion, not the flight controller
             return
         self.hb += 1
+        if base_mode & 128:
+            self.armed_hb += 1
         key = (sysid, compid, mtype, ap)
         self.sources[key] = self.sources.get(key, 0) + 1
         if self.first_hb is None:
@@ -189,7 +199,7 @@ def main():
 
     ids = ", ".join(f"{k}x{v}" for k, v in sorted(p.counts.items()))
     print(f"received {got} bytes in {a.seconds:g} s: {sum(p.counts.values())} frames, "
-          f"{p.hb} autopilot heartbeats" + (f", first at {p.first_hb:.2f} s" if p.first_hb is not None else "")
+          f"{p.hb} autopilot heartbeats, {p.armed_hb} armed" + (f", first at {p.first_hb:.2f} s" if p.first_hb is not None else "")
           + (f", {p.bad_hb_crc} heartbeat CRC failures" if p.bad_hb_crc else "")
           + (f", {p.junk} unframed bytes" if p.junk else ""))
     if len(p.sources) > 1:
