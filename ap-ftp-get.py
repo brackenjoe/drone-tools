@@ -55,6 +55,10 @@ import argparse, glob, os, struct, sys, time, unicodedata
 OP_TERM, OP_RESET, OP_LIST, OP_OPEN_RO, OP_CRC, OP_BURST = 1, 2, 3, 4, 14, 15
 ACK, NACK = 128, 129
 ERR_EOF = 6  # MAV_FTP_ERR_EOF, the error code of the NACK that ends a read
+ERR_FAILERRNO = 2  # MAV_FTP_ERR_FAILERRNO: a second data byte carries the errno
+FTP_ERR = {0: 'None', 1: 'Fail', 2: 'FailErrno', 3: 'InvalidDataSize', 4: 'InvalidSession',
+           5: 'NoSessionsAvailable', 6: 'EOF', 7: 'UnknownCommand', 8: 'FileExists',
+           9: 'FileProtected', 10: 'FileNotFound'}  # MAV_FTP_ERR
 CH = 239  # bytes of data per FILE_TRANSFER_PROTOCOL reply
 MAX_BYTES = 2 << 30  # default cap on one download
 
@@ -184,7 +188,18 @@ class FtpSession:
             if r is None:
                 raise FtpError(f"no reply listing {path}")
             if r['op'] == NACK:
-                return out
+                d = r['data']
+                if d[:1] == bytes([ERR_EOF]):
+                    return out
+                code = d[0] if d else None
+                extra = ''
+                if code is None:
+                    what = 'unknown (no code)'
+                else:
+                    if code == ERR_FAILERRNO and len(d) > 1:
+                        extra = f", errno {d[1]}"
+                    what = f"{FTP_ERR.get(code, 'unknown')} (code {code}{extra})"
+                raise FtpError(f"cannot list {inert(path)}: {what}")
             for e in r['data'].split(b'\0'):
                 if e:
                     out.append(e.decode(errors='replace'))
@@ -359,7 +374,7 @@ class _FakeFC:
 
     def __init__(self, content, announced=None, burst=2000, drop=(), swallow=0,
                  stale=0, nack_open=False, inject=(), forge=None, open_data=None,
-                 crc_data=None):
+                 crc_data=None, listing=None):
         self.content = content
         self.announced = len(content) if announced is None else announced
         self.burst = burst
@@ -370,6 +385,7 @@ class _FakeFC:
         self.forge = forge          # 'src' or 'target': a forged twin goes ahead of every burst reply
         self.open_data = open_data  # bytes: replaces the OPEN ACK's data
         self.crc_data = crc_data    # bytes: replaces the CRC ACK's data
+        self.listing = list(listing or [])  # replies to ListDirectory, one per request: (ACK|NACK, data)
         self.requests = []          # (op, size, offset) as the tool sent them
         self.nack_offsets = []
         self.q = [self._pkt(ACK, OP_BURST, CH, 0, b'\xaa' * CH) for _ in range(stale)]
@@ -399,6 +415,10 @@ class _FakeFC:
         self.requests.append((op, size, ofs))
         if op == OP_RESET or op == OP_TERM:
             self.q.append(self._pkt(ACK, op, 0, 0))
+        elif op == OP_LIST:
+            if self.listing:
+                kind, d = self.listing.pop(0)
+                self.q.append(self._pkt(kind, op, len(d), ofs, d))
         elif op == OP_OPEN_RO:
             if self.nack_open:
                 self.q.append(self._pkt(NACK, op, 2, 0, bytes([10, 0])))
@@ -743,6 +763,57 @@ def _selftest():
         assert wait_autopilot(c3, 2) is not None and (c3.target_system, c3.target_component) == (1, 1), \
             (c3.target_system, c3.target_component)
 
+    def lister(fc):
+        s = session(fc)
+        ask = s.ask
+        s.ask = lambda op, path, timeout, **kw: ask(op, path, 0.3, tries=1, **kw)
+        return s
+
+    def err_of(fn):
+        try:
+            fn()
+        except FtpError as e:
+            return str(e)
+        raise AssertionError("no FtpError")
+
+    @case("listdir: entries in order, ends on the EndOfFile NACK")
+    def _():
+        fc = _FakeFC(b'', listing=[(ACK, b'Dsub\0Fa.bin\t12\0'), (ACK, b'Fb.bin\t3\0'),
+                                   (NACK, bytes([ERR_EOF]))])
+        assert lister(fc).listdir('/d') == ['Dsub', 'Fa.bin\t12', 'Fb.bin\t3']
+        assert [r[2] for r in sent(fc, OP_LIST)] == [0, 2, 3], sent(fc, OP_LIST)
+
+    @case("listdir: an empty directory (EndOfFile NACK at offset 0) gives []")
+    def _():
+        assert lister(_FakeFC(b'', listing=[(NACK, bytes([ERR_EOF]))])).listdir('/d') == []
+
+    @case("listdir: a missing directory (NACK FileNotFound) raises, naming code and path")
+    def _():
+        m = err_of(lambda: lister(_FakeFC(b'', listing=[(NACK, bytes([10]))])).listdir('/nope'))
+        assert m == "cannot list /nope: FileNotFound (code 10)", m
+
+    @case("listdir: FailErrno carries its errno byte; the path is made inert")
+    def _():
+        m = err_of(lambda: lister(_FakeFC(b'', listing=[(NACK, bytes([2, 2]))])).listdir('/a\x1bb'))
+        assert m == "cannot list /a\\x1bb: FailErrno (code 2, errno 2)", m
+        m = err_of(lambda: lister(_FakeFC(b'', listing=[(NACK, bytes([99]))])).listdir('/d'))
+        assert m == "cannot list /d: unknown (code 99)", m
+
+    @case("listdir: a non-EOF NACK after a first page raises, no partial list")
+    def _():
+        fc = _FakeFC(b'', listing=[(ACK, b'Fa\0'), (NACK, bytes([1]))])
+        m = err_of(lambda: lister(fc).listdir('/d'))
+        assert m == "cannot list /d: Fail (code 1)", m
+
+    @case("listdir: a NACK with no data is not EndOfFile")
+    def _():
+        err_of(lambda: lister(_FakeFC(b'', listing=[(NACK, b'')])).listdir('/d'))
+
+    @case("listdir: no reply at all raises 'no reply listing'")
+    def _():
+        m = err_of(lambda: lister(_FakeFC(b'')).listdir('/d'))
+        assert m == "no reply listing /d", m
+
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
@@ -864,6 +935,8 @@ def _run(a, s):
             entries = s.listdir(a.list)
         except FtpError as e:
             sys.exit(str(e))
+        if not entries:
+            print('(empty)')
         for e in entries:
             kind, rest = e[0], e[1:]
             print(('dir  ' if kind == 'D' else 'file ') + inert(rest.replace('\t', '  ')))
