@@ -49,7 +49,7 @@ Needs pymavlink for the command line: pip install 'pymavlink>=2.4.50'
 (2.4.49 can crash at connect, a TypeError in mavutil.add_message, when a link
 switches from MAVLink 1 to 2; fixed in 2.4.50).
 """
-import argparse, glob, os, struct, sys, time, unicodedata
+import argparse, glob, os, struct, sys, tempfile, time, unicodedata
 
 # opcodes, GCS_FTP.h FTP_OP
 OP_TERM, OP_RESET, OP_LIST, OP_OPEN_RO, OP_CRC, OP_BURST = 1, 2, 3, 4, 14, 15
@@ -83,6 +83,10 @@ def inert(s):
 
 class FtpError(Exception):
     pass
+
+
+class FtpTimeout(FtpError, TimeoutError):
+    """The deadline passed. A TimeoutError too, for callers that catch that."""
 
 
 class FtpOpenError(FtpError):
@@ -170,12 +174,16 @@ class FtpSession:
             return self.drain(self.term_quiet if quiet is None else quiet,
                               self.term_cap if cap is None else cap)
 
-    def ask(self, op, path, timeout, size=None, offset=0, tries=3):
+    def ask(self, op, path, timeout, size=None, offset=0, tries=3, deadline=None):
+        """Send `op` and wait for its reply, up to `tries` times. `deadline` (an
+        absolute time) ends the wait early with None."""
         enc = path.encode()
         for _ in range(tries):
+            if deadline is not None and time.time() >= deadline:
+                return None
             self.send(op, len(enc) if size is None else size, offset, enc)
             t = time.time()
-            while time.time() - t < timeout:
+            while time.time() - t < timeout and (deadline is None or time.time() < deadline):
                 r = self.recv(0.5)
                 if r and r['req'] == op:
                     return r
@@ -186,7 +194,7 @@ class FtpSession:
         while True:
             r = self.ask(OP_LIST, path, 10, offset=ofs)
             if r is None:
-                raise FtpError(f"no reply listing {path}")
+                raise FtpError(f"no reply listing {inert(path)}")
             if r['op'] == NACK:
                 d = r['data']
                 if d[:1] == bytes([ERR_EOF]):
@@ -207,9 +215,9 @@ class FtpSession:
             if not r['data'].strip(b'\0'):
                 return out
 
-    def crc(self, remote):
+    def crc(self, remote, timeout=60, deadline=None):
         """The board's CalcFileCRC32 of `remote`, or None."""
-        r = self.ask(OP_CRC, remote, 60)
+        r = self.ask(OP_CRC, remote, timeout, deadline=deadline)
         if r and r['op'] == ACK and len(r['data']) >= 4:
             return struct.unpack('<I', r['data'][:4])[0]
         return None
@@ -233,7 +241,9 @@ class FtpSession:
 
     def _fetch(self, remote, until_eof, timeout):
         deadline = None if timeout is None else time.time() + timeout
-        r = self.ask(OP_OPEN_RO, remote, 15 if timeout is None else min(15, timeout))
+        r = self.ask(OP_OPEN_RO, remote, 15 if timeout is None else min(15, timeout), deadline=deadline)
+        if deadline is not None and time.time() >= deadline and not (r and r['op'] == ACK):
+            raise FtpTimeout(f"{inert(remote)}: no open reply within the {timeout:.0f} s deadline")
         if not r or r['op'] != ACK:
             why = inert(r['data'][:2].decode('latin-1')) if r else 'no reply'
             raise FtpOpenError(f"open {inert(remote)} failed: {why}")
@@ -246,39 +256,40 @@ class FtpSession:
         if size > self.max_bytes:
             raise FtpError(f"{inert(remote)}: {size} bytes announced, above the {self.max_bytes} cap")
         self.log(f"open ok, {size} bytes")
-        buf = bytearray(size)
-        have = set()
+        chunks = {}          # offset -> data: memory follows what was delivered, not `size`
         nchunks = (size + CH - 1) // CH
+        first = 0            # index of the first chunk not held; only moves forward
         t0 = last_print = time.time()
         self.send(OP_BURST, CH, 0)
         last_rx = time.time()
-        while len(have) < nchunks:
+        while first < nchunks:
             r = self.recv(0.5)
             now = time.time()
             if deadline is not None and now > deadline:
-                raise TimeoutError(f"{remote}: {len(have)} of {nchunks} chunks after {now - t0:.0f} s")
+                raise FtpTimeout(f"{inert(remote)}: {len(chunks)} of {nchunks} chunks after {now - t0:.0f} s, deadline passed")
             if r is not None:
                 last_rx = now
                 if (r['op'] == ACK and r['req'] == OP_BURST and 0 <= r['ofs'] < size
                         and r['ofs'] % CH == 0
                         and len(r['data']) == r['size'] == min(CH, size - r['ofs'])):
-                    buf[r['ofs']:r['ofs'] + r['size']] = r['data']
-                    have.add(r['ofs'])
+                    chunks[r['ofs']] = r['data']
+                    while first < nchunks and first * CH in chunks:
+                        first += 1
                 done = r['req'] == OP_BURST and (r['bc'] or r['op'] == NACK)
             else:
                 done = now - last_rx > self.stall
             if now - last_print > 10:
-                self.log(f"  {len(have) * CH // 1024} of {size // 1024} KiB, {now - t0:.0f} s")
+                self.log(f"  {len(chunks) * CH // 1024} of {size // 1024} KiB, {now - t0:.0f} s")
                 last_print = now
-            if done and len(have) < nchunks:
-                gap = next(i * CH for i in range(nchunks) if i * CH not in have)
-                self.send(OP_BURST, CH, gap)
+            if done and first < nchunks:
+                self.send(OP_BURST, CH, first * CH)
                 last_rx = now
-        if len(buf) != size or len(have) != nchunks:
-            raise FtpError(f"{inert(remote)}: {len(have)} of {nchunks} chunks, {len(buf)} of {size} bytes")
+        buf = b''.join(chunks[i * CH] for i in range(nchunks))
+        if len(buf) != size or len(chunks) != nchunks:
+            raise FtpError(f"{inert(remote)}: {len(chunks)} of {nchunks} chunks, {len(buf)} of {size} bytes")
         self.last_dt = time.time() - t0
         self.last_size = size
-        return bytes(buf)
+        return buf
 
     def _read_to_eof(self, deadline):
         """Read from 0 until the end is known and every chunk below it is held.
@@ -293,6 +304,7 @@ class FtpSession:
         end = None
         req = 0            # offset of the latest burst request
         zero_nacks = 0
+        first = 0          # index of the first chunk not held; only moves forward
         t0 = last_print = time.time()
         self.send(OP_BURST, CH, 0)
         last_rx = time.time()
@@ -300,7 +312,7 @@ class FtpSession:
             r = self.recv(0.5)
             now = time.time()
             if deadline is not None and now > deadline:
-                raise TimeoutError(f"{len(chunks)} chunks after {now - t0:.0f} s, end "
+                raise FtpTimeout(f"{len(chunks)} chunks after {now - t0:.0f} s, end "
                                    + ("not found" if end is None else f"at {end}"))
             if r is not None:
                 last_rx = now
@@ -311,6 +323,8 @@ class FtpSession:
                         if r['ofs'] + r['size'] > self.max_bytes:
                             raise FtpError(f"more than {self.max_bytes} bytes, giving up")
                         chunks[r['ofs']] = r['data']
+                        while first * CH in chunks:
+                            first += 1
                         if r['size'] < CH and end is None:
                             end = r['ofs'] + r['size']
                     elif r['op'] == NACK and r['data'][:1] == bytes([ERR_EOF]) and end is None:
@@ -326,21 +340,23 @@ class FtpSession:
                                     cand = 0
                         elif r['ofs'] % CH == 0:
                             cand = r['ofs'] + CH         # the last full chunk was at ofs
-                        if cand is not None and not any(o >= cand for o in chunks):
+                        if cand is not None:
+                            # a chunk at or past the end is stray: drop it, take the end
+                            for o in [o for o in chunks if o >= cand]:
+                                del chunks[o]
+                            first = min(first, cand // CH)
                             end = cand
                 done = r['req'] == OP_BURST and (r['bc'] or r['op'] == NACK)
             else:
                 done = now - last_rx > self.stall
             if end is not None:
-                need = (end + CH - 1) // CH
-                if len(chunks) >= need and all(i * CH in chunks for i in range(need)):
+                if first >= (end + CH - 1) // CH:
                     break
             if now - last_print > 10:
                 self.log(f"  {len(chunks) * CH // 1024} KiB, {now - t0:.0f} s")
                 last_print = now
             if done:
-                top = (end + CH - 1) // CH if end is not None else len(chunks) + 1
-                gap = next(i * CH for i in range(top + 1) if i * CH not in chunks)
+                gap = first * CH
                 req = gap
                 self.send(OP_BURST, CH, gap)
                 last_rx = now
@@ -672,7 +688,7 @@ def _selftest():
         same(s.fetch('/x'), data)
         assert s.dropped == 0
 
-    @case("an announced size above max_bytes is refused before allocation")
+    @case("an announced size above max_bytes is refused before any data is read")
     def _():
         fc = _FakeFC(blob(5000))
         try:
@@ -735,8 +751,8 @@ def _selftest():
     @case("wait_autopilot skips GCS and gimbal heartbeats and pins the autopilot's system and component")
     def _():
         class _HB:
-            def __init__(self, sysid, comp, autopilot):
-                self.sc, self.autopilot = (sysid, comp), autopilot
+            def __init__(self, sysid, comp, autopilot, typ=2):
+                self.sc, self.autopilot, self.type = (sysid, comp), autopilot, typ
 
             def get_srcSystem(self):
                 return self.sc[0]
@@ -747,7 +763,7 @@ def _selftest():
         class _Conn:
             target_system = target_component = 0
             q = [_HB(255, 190, MAV_AUTOPILOT_INVALID), _HB(1, 154, MAV_AUTOPILOT_INVALID),
-                 _HB(1, 1, 3)]
+                 _HB(254, 1, 3, MAV_TYPE_GCS), _HB(1, 1, 3)]
 
             def recv_match(self, type=None, blocking=True, timeout=None):
                 return self.q.pop(0) if self.q else None
@@ -814,6 +830,117 @@ def _selftest():
         m = err_of(lambda: lister(_FakeFC(b'')).listdir('/d'))
         assert m == "no reply listing /d", m
 
+    @case("memory follows delivered data: a 1 GiB announce with no data stays under 64 MiB")
+    def _():
+        def rss():
+            for ln in open('/proc/self/status'):
+                if ln.startswith('VmRSS'):
+                    return int(ln.split()[1]) / 1024
+        try:
+            open('/proc/self/status').close()
+        except OSError:
+            print("SKIP  1 GiB announce (no /proc/self/status)")
+            return
+        fc = _FakeFC(b'', announced=1 << 30, swallow=10 ** 9)
+        s = session(fc, stall=0.2)
+        assert s.max_bytes == MAX_BYTES
+        base, top = rss(), []
+        real = s.recv
+        s.recv = lambda t: (top.append(rss()), real(t))[1]
+        try:
+            s.fetch('/x', timeout=1.0)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("no TimeoutError")
+        assert top and max(top) - base < 64, (base, max(top))
+
+    @case("known size and until_eof: out-of-order and duplicated chunks give the source bytes")
+    def _():
+        data = blob(CH * 6 + 17)
+        chunk = lambda i: data[i * CH:(i + 1) * CH]
+        order = [5, 3, 3, 0, 4, 4, 1, 5, 6, 6, 0]
+        inj = [pkt(ACK, OP_BURST, len(chunk(i)), i * CH, chunk(i)) for i in order]
+        for eof in (False, True):
+            fc = _FakeFC(data, inject=list(inj), drop={CH * 2})
+            same(session(fc).fetch('/x', until_eof=eof), data)
+
+    @case("a peer answering every burst with bc=1 and no data: time per round stays flat")
+    def _():
+        class _Stop(Exception):
+            pass
+
+        class Chatty(_FakeFC):
+            def __init__(self):
+                super().__init__(b'', announced=CH * 400000)
+                self.ts = []
+
+            def _on_request(self, b):
+                op = b[3]
+                if op != OP_BURST:
+                    return super()._on_request(b)
+                self.ts.append(time.perf_counter())
+                if len(self.ts) > 2000:
+                    raise _Stop
+                self.q.append(self._pkt(ACK, OP_BURST, 0, 0, b'', 1))
+        for eof in (False, True):
+            fc = Chatty()
+            try:
+                session(fc).fetch('/x', until_eof=eof)
+            except _Stop:
+                pass
+            ts = fc.ts
+            first, last = ts[100] - ts[0], ts[-1] - ts[-101]
+            assert last <= 2 * first + 0.005, (eof, first, last)
+
+    @case("until_eof: one stray chunk past the EOF end does not stop the read")
+    def _():
+        data = blob(CH * 7)
+        fc = _FakeFC(data, inject=[pkt(ACK, OP_BURST, CH, CH * 50, b'\xee' * CH)])
+        t = time.time()
+        same(session(fc).fetch('/x', until_eof=True, timeout=5), data)
+        assert time.time() - t < 3
+
+    @case("the deadline: a silent FC with timeout 1 s raises FtpTimeout (an FtpError) in about 1 s")
+    def _():
+        class Silent(_FakeFC):
+            def _on_request(self, b):
+                self.requests.append((b[3], 0, 0))
+        for eof in (False, True):
+            fc = Silent(b'')
+            t = time.time()
+            try:
+                session(fc).fetch('/x', until_eof=eof, timeout=1.0)
+            except FtpTimeout as e:
+                assert isinstance(e, FtpError) and isinstance(e, TimeoutError)
+            else:
+                raise AssertionError("no FtpTimeout")
+            dt = time.time() - t
+            assert 0.9 <= dt < 2.0, dt
+
+    @case("output files: a planted <local>.part or .crc-mismatch symlink is not written through")
+    def _():
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            victim = os.path.join(d, 'victim')
+            open(victim, 'wb').write(b'keep')
+            local = os.path.join(d, 'out.BIN')
+            for suffix in ('.part', '.crc-mismatch'):
+                os.symlink(victim, local + suffix)
+            _write_atomic(local + '.crc-mismatch', b'bad')
+            _write_atomic(local, b'good')
+            assert open(victim, 'rb').read() == b'keep'
+            assert open(local, 'rb').read() == b'good'
+            bad = local + '.crc-mismatch'
+            assert not os.path.islink(bad) and open(bad, 'rb').read() == b'bad'
+            um = os.umask(0)
+            os.umask(um)
+            assert os.stat(local).st_mode & 0o777 == 0o666 & ~um
+            assert sorted(os.listdir(d)) == ['out.BIN', 'out.BIN.crc-mismatch', 'out.BIN.part', 'victim']
+        finally:
+            shutil.rmtree(d)
+
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
@@ -830,6 +957,7 @@ def find_device():
 
 
 MAV_AUTOPILOT_INVALID = 8   # MAVLink common.xml: a heartbeat from something that is not an autopilot
+MAV_TYPE_GCS = 6            # MAVLink common.xml MAV_TYPE: a ground station, never the vehicle
 
 
 def wait_autopilot(m, timeout):
@@ -844,7 +972,7 @@ def wait_autopilot(m, timeout):
         hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=max(0.1, deadline - time.time()))
         if hb is None:
             continue
-        if hb.autopilot == MAV_AUTOPILOT_INVALID:
+        if hb.autopilot == MAV_AUTOPILOT_INVALID or getattr(hb, 'type', None) == MAV_TYPE_GCS:
             continue
         if not hb.get_srcSystem() or not hb.get_srcComponent():   # 0 is broadcast, not a vehicle
             continue
@@ -867,12 +995,17 @@ def main(argv=None):
     ap.add_argument('--stall', type=float, default=5.0, help='seconds of silence before re-asking (default 5)')
     ap.add_argument('--max-mib', type=int, default=MAX_BYTES >> 20,
                     help='refuse a file larger than this many MiB (default 2048)')
+    ap.add_argument('--timeout', type=float, default=600.0, metavar='S',
+                    help='seconds allowed for one download, --last-log included (default 600); '
+                         'not applied to --list')
     ap.add_argument('--selftest', action='store_true', help='run the offline tests and exit')
     a = ap.parse_args(argv)
     if a.selftest:
         return _selftest()
     if not (a.list or a.last_log or (a.remote and a.local)):
         ap.error('give REMOTE LOCAL, --list DIR or --last-log DIR')
+    if not a.timeout > 0:
+        ap.error('--timeout must be above 0')
 
     try:
         from pymavlink import mavutil
@@ -907,24 +1040,48 @@ def main(argv=None):
                   file=sys.stderr, flush=True)
 
 
+def _write_atomic(path, data):
+    """Write `data` to a fresh temporary file beside `path` (mkstemp: a random
+    name, O_EXCL, so a planted symlink is never followed) and rename it over
+    `path`. Mode 0o666 & ~umask, as ap-param-dump.py does. Nothing is left
+    behind on a failure."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.part')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        um = os.umask(0)
+        os.umask(um)
+        os.chmod(tmp, 0o666 & ~um)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def _run(a, s):
+    deadline = None
+
     def get(remote, local):
         try:
-            buf = s.fetch(remote)
+            buf = s.fetch(remote, timeout=max(deadline - time.time(), 0.001))
         except FtpError as e:
             sys.exit(str(e))
         size, dt = s.last_size, s.last_dt
         print(f"got {size} bytes in {dt:.1f} s, {size / max(dt, 1e-3) / 1024:.1f} KiB/s", flush=True)
-        board = s.crc(remote)
+        left = deadline - time.time()
+        if left <= 0:
+            s.terminate(drain=False)
+            sys.exit(f"{inert(remote)}: --timeout {a.timeout:g} s passed before the CRC check")
+        board = s.crc(remote, timeout=min(60, max(left / 3, 1)), deadline=deadline)
         local_crc = ap_crc32(buf)
         s.terminate(drain=False)
         if board != local_crc:
             bad = local + '.crc-mismatch'
-            open(bad, 'wb').write(buf)
+            _write_atomic(bad, buf)
             sys.exit(f"CRC MISMATCH: board {board and hex(board)}, local {hex(local_crc)}; kept as {bad}")
-        tmp = local + '.part'
-        open(tmp, 'wb').write(buf)
-        os.replace(tmp, local)
+        _write_atomic(local, buf)
         print(f"VERIFIED: CRC {hex(local_crc)} matches the board; wrote {local}")
 
     n, dt = s.reset()
@@ -943,20 +1100,23 @@ def _run(a, s):
         s.terminate(drain=False)
         return 0
 
+    deadline = time.time() + a.timeout
     if a.last_log:
-        r = s.ask(OP_OPEN_RO, '/APM/LOGS/LASTLOG.TXT', 15)
+        r = s.ask(OP_OPEN_RO, '/APM/LOGS/LASTLOG.TXT', 15, deadline=deadline)
         if not r or r['op'] != ACK:
             sys.exit("cannot open /APM/LOGS/LASTLOG.TXT")
         s.send(OP_BURST, CH, 0)
         txt = b''
         t = time.time()
-        while time.time() - t < 15:
+        while time.time() - t < 15 and time.time() < deadline:
             x = s.recv(0.5)
             if x and x['req'] == OP_BURST and x['op'] == ACK:
                 txt = x['data']; break
         s.terminate(quiet=3.0, cap=30)
         digits = txt.strip()
         num = int(digits) if digits.isdigit() and len(digits) <= 8 else 0
+        if num <= 0 and time.time() >= deadline:
+            sys.exit(f"--timeout {a.timeout:g} s passed reading LASTLOG.TXT")
         if num <= 0:
             sys.exit(f"LASTLOG.TXT unreadable: {txt!r}")
         a.remote = f'/APM/LOGS/{num:08d}.BIN'

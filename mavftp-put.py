@@ -205,10 +205,18 @@ def refuse_if_armed(m, sysid, compid):
         sys.exit("REFUSED: the vehicle is armed")
 
 
+# this tool's own MAVLink source ids: the connection uses them, and PinnedLink
+# takes an FTP message only if it is addressed to them
+SRC_SYSTEM, SRC_COMPONENT = 250, 190
+
+
 class PinnedLink:
     """The link as MAVFTP sees it: everything delegates to the real link, but a
     FILE_TRANSFER_PROTOCOL message is taken only from the pinned autopilot
-    (sysid, compid), as recv_from does for heartbeats. pymavlink's MAVFTP reads
+    (sysid, compid), as recv_from does for heartbeats, and only if it is
+    addressed to this tool (target_system/target_component equal
+    SRC_SYSTEM/SRC_COMPONENT), so the guard does not depend on pymavlink's
+    own target filtering. pymavlink's MAVFTP reads
     through recv_match only and accepts a reply from any source. A foreign
     message is dropped and the wait goes on to its own deadline; a
     non-blocking read keeps reading past foreign messages and returns None
@@ -234,7 +242,9 @@ class PinnedLink:
                 return None
             if (msg.get_type() != 'FILE_TRANSFER_PROTOCOL'
                     or (msg.get_srcSystem() == self._sysid
-                        and msg.get_srcComponent() == self._compid)):
+                        and msg.get_srcComponent() == self._compid
+                        and msg.target_system == SRC_SYSTEM
+                        and msg.target_component == SRC_COMPONENT)):
                 return msg
             foreign += 1
             if blocking:
@@ -657,8 +667,9 @@ def _selftest():
         @case("FTP link wrapper drops a foreign FILE_TRANSFER_PROTOCOL and passes the pinned one")
         def _():
             class Msg:
-                def __init__(self, t, sysid, compid):
+                def __init__(self, t, sysid, compid, tgt=(250, 190)):
                     self.t, self.s, self.c = t, sysid, compid
+                    self.target_system, self.target_component = tgt
 
                 def get_type(self):
                     return self.t
@@ -692,6 +703,11 @@ def _selftest():
             assert fl.recv_match(type='FILE_TRANSFER_PROTOCOL') is None
             assert PinnedLink(Link([evil, evil]), 1, 1).recv_match(blocking=True, timeout=1) is None
             assert PinnedLink(Link([hb]), 1, 1).recv_match() is hb   # only FTP is filtered
+            # from the pinned ids but addressed to another station (a GCS at 255): dropped
+            to255 = Msg('FILE_TRANSFER_PROTOCOL', 1, 1, (255, 0))
+            assert PinnedLink(Link([to255]), 1, 1).recv_match(type='FILE_TRANSFER_PROTOCOL') is None
+            assert PinnedLink(Link([to255, good]), 1, 1).recv_match(
+                type='FILE_TRANSFER_PROTOCOL') is good
 
         @case("pin_autopilot skips a heartbeat from sysid 0 or compid 0")
         def _():
@@ -846,7 +862,7 @@ def main():
     device = a.device or find_device()
     print(f"connecting to {device} ...")
     try:
-        m = mavutil.mavlink_connection(device, baud=a.baud, source_system=250, source_component=190)
+        m = mavutil.mavlink_connection(device, baud=a.baud, source_system=SRC_SYSTEM, source_component=SRC_COMPONENT)
     except Exception as e:
         sys.exit(f"cannot open {device}: {e}")
     if pin_autopilot(m, 25) is None:

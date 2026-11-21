@@ -7,13 +7,16 @@ discards it. It speaks to one flight controller only, chosen by its board id,
 firmware and unique id, and refuses to start or accept while the vehicle is armed.
 
   start    MAV_CMD_DO_START_MAG_CAL with mask 0, no retry, NOT autosaved, then
-           print progress until a MAG_CAL_REPORT arrives or --timeout passes
-           (then it cancels). Mask 0 means every compass IN USE: the FC skips,
+           print progress until every started compass has reported (a report
+           for each bit of the started mask) or --timeout passes (then it
+           cancels). Mask 0 means every compass IN USE: the FC skips,
            without saying so, one that is not healthy or has COMPASS_USEn=0
            (AP_Compass_Calibration.cpp:50-55), and refuses the whole start if
            COMPASS_LEARN is 2 (in-flight learning makes no compass usable for
            yaw, :53, AP_Compass.cpp:2030). The mask the FC actually started is
-           printed from the first MAG_CAL_PROGRESS. The report is printed in
+           printed from the first valid MAG_CAL_PROGRESS, and printed again
+           as "started mask widened to ..." if a later valid PROGRESS adds a
+           compass. The report is printed in
            full: fitness, offsets, diagonals, off-diagonals, scale, and the
            orientation check (COMPASS_AUTO_ROT) with its confidence
   accept   MAV_CMD_DO_ACCEPT_MAG_CAL: saves the last successful result,
@@ -91,6 +94,20 @@ OFS_SETS = [(0, 'COMPASS_OFS'), (1, 'COMPASS_OFS2'), (2, 'COMPASS_OFS3')]
 STATUS = {0: 'NOT_STARTED', 1: 'WAITING_TO_START', 2: 'RUNNING_STEP_ONE',
           3: 'RUNNING_STEP_TWO', 4: 'SUCCESS', 5: 'FAILED', 6: 'BAD_ORIENTATION',
           7: 'BAD_RADIUS'}
+
+
+# this tool's own MAVLink source ids, used at the connection and to tell an
+# answer addressed to it from one addressed to another station on the link
+SRC_SYSTEM, SRC_COMPONENT = 250, 190
+
+
+def addressed_to_us(msg):
+    """True if a message's target_system/target_component are this tool's own
+    source ids, or 0/0 (MAVLink 1 has no target fields on a COMMAND_ACK, and
+    pymavlink fills 0). An answer meant for another station on the link
+    (a GCS at 255, say) is not ours."""
+    t = (msg.target_system, msg.target_component)
+    return t == (SRC_SYSTEM, SRC_COMPONENT) or t == (0, 0)
 
 
 def recv_from(m, types, sysid, compid, timeout, condition=None):
@@ -213,7 +230,7 @@ def send_command(m, sysid, compid, cmd, params=(), guard_armed=False, tries=3, w
                 if guard_armed and is_armed(msg):
                     sys.exit(f"STOPPED: the FC armed while command {cmd} waited for its ACK "
                              f"(sent {sent} time(s)); it may have been applied")
-            elif msg.command == cmd:
+            elif msg.command == cmd and addressed_to_us(msg):
                 return msg.result
     return None
 
@@ -505,8 +522,9 @@ def selftest():
             time.sleep(min(timeout or 0, 0.02))
             return None
 
-    def ack(cmd, result=0, src=(1, 1)):
-        x = NS(command=cmd, result=result, get_type=lambda: 'COMMAND_ACK')
+    def ack(cmd, result=0, src=(1, 1), tgt=(250, 190)):
+        x = NS(command=cmd, result=result, get_type=lambda: 'COMMAND_ACK',
+               target_system=tgt[0], target_component=tgt[1])
         x.get_srcSystem, x.get_srcComponent = (lambda: src[0]), (lambda: src[1])
         return x
 
@@ -532,6 +550,11 @@ def selftest():
           sc(Link([[beat(True), ack(42425, 0)]]), False) == 0)
     check("send_command: an ACK for another command or from another source is skipped",
           sc(Link([[ack(42424, 0), ack(42425, 0, (9, 9))]]), True, tries=1) is None)
+    check("send_command: an ACK addressed to 255 is not taken (wait goes on, then the right one is)",
+          sc(Link([[ack(42425, 0, tgt=(255, 0)), ack(42425, 5, tgt=(250, 190))]]), True, tries=1) == 5
+          and sc(Link([[ack(42425, 0, tgt=(255, 0))]]), True, tries=1) is None)
+    check("send_command: an ACK with target 0/0 (MAVLink 1) is taken",
+          sc(Link([[ack(42425, 3, tgt=(0, 0))]]), True, tries=1) == 3)
     check("send_command: no ACK in 3 tries -> None, 3 sends",
           (lambda l: (sc(l, True), l.sent))(Link([[], [], []])) == (None, 3))
     # --- the armed re-check right before the command (a link that arms mid-run)
@@ -547,6 +570,7 @@ def selftest():
         def command_long_send(self, sysid, compid, cmd, *rest):
             self.cmds.append(cmd)
             self.ack.append(NS(command=cmd, result=0, get_type=lambda: 'COMMAND_ACK',
+                               target_system=250, target_component=190,
                                get_srcSystem=lambda: 1, get_srcComponent=lambda: 1))
 
         def param_request_read_send(self, sysid, compid, name, idx):
@@ -654,7 +678,7 @@ def selftest():
     check("accept: NaN compass beside a real change -> only the real one saved",
           rc == 0 and ls[-1] == "saved: compass 1")
 
-    # --- watch: the started mask is frozen, a report cannot shrink it
+    # --- watch: the started mask only grows from valid PROGRESS; a report cannot shrink or widen it
     def mmsg(kind, cid, mask, status=4):
         return NS(get_type=lambda: kind, compass_id=cid, cal_mask=mask, cal_status=status,
                   attempt=1, completion_pct=10, autosaved=0, fitness=0.05, ofs_x=1.0,
@@ -675,7 +699,7 @@ def selftest():
           rc == 3 and cancels == [CANCEL] and not any("all reports in" in x for x in said))
     rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b11), mmsg('MAG_CAL_REPORT', 0, 0b11),
                                    mmsg('MAG_CAL_REPORT', 1, 0)])
-    check("watch: every bit of the frozen mask reported -> all reports in, exit 0",
+    check("watch: every bit of the started mask reported -> all reports in, exit 0",
           rc == 0 and cancels == [] and any("all reports in" in x for x in said))
     rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b01), mmsg('MAG_CAL_REPORT', 0, 0b11)])
     check("watch: a report's wider mask does not widen the started mask",
@@ -696,6 +720,20 @@ def selftest():
                                    mmsg('MAG_CAL_REPORT', 0, 0xff)], timeout=0.5)
     check("watch: compass id above 7 is ignored even with a full mask",
           not any("REPORT compass 9" in x for x in said) and any("ignored MAG_CAL_REPORT for compass 9" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b01), mmsg('MAG_CAL_PROGRESS', 9, 0xff),
+                                   mmsg('MAG_CAL_REPORT', 0, 0b01)])
+    check("watch: a PROGRESS with compass_id 9 and mask 0xff does not widen the mask",
+          rc == 0 and any("all reports in" in x for x in said)
+          and not any("widened" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b01), mmsg('MAG_CAL_PROGRESS', 1, 0b01),
+                                   mmsg('MAG_CAL_REPORT', 0, 0b01)])
+    check("watch: a PROGRESS whose own bit is not in its own mask does not widen the mask",
+          rc == 0 and not any("widened" in x for x in said))
+    rc, cancels, said = run_watch([mmsg('MAG_CAL_PROGRESS', 0, 0b01), mmsg('MAG_CAL_PROGRESS', 1, 0b11),
+                                   mmsg('MAG_CAL_REPORT', 0, 0b01)])
+    check("watch: a valid PROGRESS widens the mask and says so once; the mask only grows",
+          rc == 3 and sum("started mask widened to" in x for x in said) == 1
+          and sum("started mask 0b001" in x for x in said) == 1)
     print(f"{n_ok} passed, {n_bad} failed")
     return 0 if n_bad == 0 else 1
 
@@ -769,8 +807,8 @@ def main():
 
 
 def run(a, say):
-    m = mavutil.mavlink_connection(a.device, baud=a.baud, source_system=250,
-                                   source_component=190, autoreconnect=False)
+    m = mavutil.mavlink_connection(a.device, baud=a.baud, source_system=SRC_SYSTEM,
+                                   source_component=SRC_COMPONENT, autoreconnect=False)
     # Through a router the first heartbeat may be a GCS's: pin the autopilot's.
     end, hb = time.time() + 30, None
     while time.time() < end:
@@ -876,8 +914,8 @@ def act(m, sysid, compid, a, say):
 def watch(m, sysid, compid, timeout, say, command):
     """Print progress and reports until every started compass has reported or
     `timeout` s pass (then cancel). Exit code of the run."""
-    t0, last_print, reports, mask_said = time.time(), 0.0, {}, False
-    progress, mask, ignored = {}, None, set()   # mask: frozen from the first PROGRESS only
+    t0, last_print, reports, mask_said = time.time(), 0.0, {}, None
+    progress, mask, ignored = {}, None, set()   # mask: union of the masks in valid PROGRESS messages; only grows
     while time.time() - t0 < timeout:
         msg = recv_from(m, ['MAG_CAL_PROGRESS', 'MAG_CAL_REPORT', 'STATUSTEXT'],
                         sysid, compid, 1)
@@ -887,9 +925,12 @@ def watch(m, sysid, compid, timeout, say, command):
         if t == 'STATUSTEXT':
             say(f"FC: {inert(msg.text)}")
             continue
-        if t == 'MAG_CAL_PROGRESS':
+        if (t == 'MAG_CAL_PROGRESS' and 0 <= msg.compass_id <= 7
+                and (msg.cal_mask >> msg.compass_id) & 1):
             # the FC starts its calibrators one by one, so an early progress may not yet
-            # name them all: the started mask is the union of every progress mask
+            # name them all: the started mask is the union of the masks in VALID progress
+            # messages (compass_id 0..7 and its own bit set in its own mask), and only
+            # grows. An invalid progress, like a report, never sets or widens it.
             mask = msg.cal_mask | (mask or 0)
         if mask is None or not 0 <= msg.compass_id <= 7 or not (mask >> msg.compass_id) & 1:
             # a report before any progress, or for a compass that was not started, is not
@@ -899,11 +940,12 @@ def watch(m, sysid, compid, timeout, say, command):
                 say(f"ignored {t} for compass {inert(str(msg.compass_id))}: "
                     + ("no MAG_CAL_PROGRESS yet" if mask is None else "not in the started mask"))
             continue
-        if not mask_said:
-            mask_said = True
+        if mask_said != mask or mask_said is None:
             on = [i for i in range(8) if (mask >> i) & 1]
-            say(f"started mask {mask:#05b}: compass {', '.join(map(str, on)) or 'none'} "
+            say(f"{'started mask' if mask_said is None else 'started mask widened to'} "
+                f"{mask:#05b}: compass {', '.join(map(str, on)) or 'none'} "
                 f"(mask 0 skips unhealthy and COMPASS_USEn=0 compasses)")
+            mask_said = mask
         if t == 'MAG_CAL_PROGRESS':
             progress[msg.compass_id] = msg
             if time.time() - last_print >= 2:

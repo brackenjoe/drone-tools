@@ -14,7 +14,8 @@ does not shows the forged one.
   ap-param-dump.py    pin; PARAM_VALUE fallback; health snapshot (version, STATUSTEXT)
   ap-param-apply.py   real uid shown, forged --expect-uid refuses; real PARAM_VALUE;
                       armed re-tested after plan and before each PARAM_SET; git string made inert;
-                      forged COMMAND_ACK ignored
+                      forged COMMAND_ACK ignored; a NaN current value; a NaN readback;
+                      an arm on an unanswered PARAM_SET; a reboot ACK addressed to another GCS
   ap-mag-cal.py       forged --expect-* refuses; forged COMMAND_ACK ignored;
                       forged STATUSTEXT not shown
                       armed re-checked before ACCEPT (FC arms during the offset reads);
@@ -32,7 +33,9 @@ does not shows the forged one.
                       nothing but PARAM_REQUEST_READ reaches the vehicle; sitl-flight-test: a forged COMMAND_ACK 400
                       and ARMED heartbeat from another system never lead to a takeoff
                       (the fake echoes DO_SET_MODE, as the tool confirms GUIDED before arming);
-                      a fake that ignores DO_SET_MODE: exit 1, "not confirmed", no arm command
+                      a fake that ignores DO_SET_MODE: exit 1, "not confirmed", no arm command;
+                      sitl-flight-test: a heartbeat type that is not the --vehicle;
+                      sitl-qhover-steps: --climb-pwm out of range
   pin, one case per tool (ap-version, ap-param-apply identify, ap-heading-watch, ap-mag-cal,
   mavftp-put --verify-only, sitl-flight-test): an autopilot-looking heartbeat from (0,0) arrives
                       first; the tool pins (1,1) (requests go there, the real value shows)
@@ -61,9 +64,12 @@ class Peer:
                  real_ack=False, forge_text=False, att=False, dual=None, git=REAL_GIT,
                  arm_on_read=False, arm_on_set=False, writable=False, arm_quiet_on_set=0, mute_after_set=0,
                  arm_on_ofs=False, raw_text=None, gps=False, sim=True, forge_speedup=False,
-                 forge_arm=False, zero_first=False, echo_mode=False):
+                 forge_arm=False, zero_first=False, echo_mode=False, read_val=42.0, set_val=None, ack_to=None,
+                 mav_type=mavutil.mavlink.MAV_TYPE_QUADROTOR):
         self.port = port
         self.git = git
+        self.mav_type = mav_type          # MAV_TYPE of the autopilot's own heartbeat
+        self.read_val, self.set_val, self.ack_to = read_val, set_val, ack_to   # FC's value; readback override; ACK target (sys, comp)
         self.zero_first = zero_first      # an autopilot-looking heartbeat from (0,0) ahead of every real one
         self.echo_mode, self.custom = echo_mode, 0   # DO_SET_MODE's custom_mode shows in the (1,1) heartbeat
         self.arm_on_read, self.arm_on_set, self.writable = arm_on_read, arm_on_set, writable
@@ -114,7 +120,7 @@ class Peer:
             self.send(GCS, 'heartbeat_send', mavutil.mavlink.MAV_TYPE_GCS,
                       mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 4)
             time.sleep(0.05)
-            self.send(AP, 'heartbeat_send', mavutil.mavlink.MAV_TYPE_QUADROTOR,
+            self.send(AP, 'heartbeat_send', self.mav_type,
                       mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA, self.mode(), self.custom, 4)
             if self.gps:
                 self.send(AP, 'gps_raw_int_send', 0, 3, 0, 0, 0, 0, 0, 0, 0, 9)
@@ -177,6 +183,8 @@ class Peer:
                     if self.forge_ack:
                         for who in (OTHER_SYS, OTHER_COMP):
                             self.send(who, 'command_ack_send', cmd, 0)
+                    if self.ack_to:
+                        self.send(AP, 'command_ack_send', cmd, 0, 0, 0, *self.ack_to)
                     if self.real_ack:
                         self.send(AP, 'command_ack_send', cmd, 0)
                         if cmd == 42424 and self.forge_text:
@@ -192,7 +200,7 @@ class Peer:
                     self.armed = True   # silent: only the periodic heartbeat reports it, as on a real FC
                 if self.writable:
                     name = x.param_id.encode() if isinstance(x.param_id, str) else x.param_id
-                    self.send(AP, 'param_value_send', name, x.param_value, 9, 1, 0)
+                    self.send(AP, 'param_value_send', name, x.param_value if self.set_val is None else self.set_val, 9, 1, 0)
             elif t == 'PARAM_REQUEST_READ':
                 name = x.param_id.encode() if isinstance(x.param_id, str) else x.param_id
                 if self.arm_on_read and not self.armed:
@@ -206,7 +214,7 @@ class Peer:
                         continue
                 if self.forge_param:
                     self.send(OTHER_COMP, 'param_value_send', name, 111.0, 9, 1, 0)
-                self.send(AP, 'param_value_send', name, 42.0, 9, 1, 0)
+                self.send(AP, 'param_value_send', name, self.read_val, 9, 1, 0)
             elif t == 'PARAM_REQUEST_LIST':
                 if self.forge_param:
                     self.send(OTHER_COMP, 'param_value_send', b'FORGED', 111.0, 9, 1, 0)
@@ -413,6 +421,31 @@ def main():
           and 'REFUSED' not in out and npset(p) == 1
           and 'wrote 1 of 3; next was PB' in out, f"{p.seen}\n{out}")
 
+    # non-finite values, an arm mid-retry, a misaddressed reboot ACK
+    nan = float('nan')
+    p = peer(read_val=nan)
+    rc, out = p.run([py, T('ap-param-apply.py'), 'plan', dev(p), pf], timeout=40, cwd=wd)
+    check("ap-param-apply plan: FC reports NaN as the current value -> no traceback, 0 PARAM_SET",
+          rc in (0, 1) and 'Traceback' not in out and npset(p) == 0, f"rc {rc}\n{p.seen}\n{out}")
+    nl = os.path.join(wd, 'nan.tsv')
+    nf = os.path.join(wd, 'nan.param')
+    open(nf, 'w').write('PA,1\n')
+    p = peer(writable=True, set_val=nan)
+    rc, out = p.run([py, T('ap-param-apply.py'), 'write', dev(p), nf, '--log', nl] + wexp, timeout=40, cwd=wd)
+    lg = open(nl).read() if os.path.exists(nl) else ''
+    check("ap-param-apply write: first readback NaN -> no traceback, sent write logged, FAILED shown",
+          'Traceback' not in out and npset(p) >= 1 and '\tPA\t' in lg and 'FAILED' in out and rc == 1,
+          f"rc {rc}\nlog {lg!r}\n{p.seen}\n{out}")
+    p = peer(arm_on_set=True)    # arms on the first PARAM_SET and never answers it
+    rc, out = p.run([py, T('ap-param-apply.py'), 'write', dev(p), wf] + wexp, timeout=60, cwd=wd)
+    check("ap-param-apply write: FC arms on an unanswered PARAM_SET -> exactly 1 PARAM_SET, STOPPED",
+          rc != 0 and npset(p) == 1 and 'STOPPED' in out, f"rc {rc}\n{p.seen}\n{out}")
+    p = peer(ack_to=(255, 190))
+    rc, out = p.run([py, T('ap-param-apply.py'), 'reboot', dev(p), '--expect-uid', REAL_UID] + exp,
+                    timeout=40, cwd=wd)
+    check("ap-param-apply reboot: the only ACK addressed to 255 is not reported accepted",
+          rc == 1 and 'ACK result 0' not in out and 'ACK result None' in out, f"rc {rc}\n{out}")
+
     p = peer(writable=True, mute_after_set=3)
     rc, out = p.run([py, T('ap-param-apply.py'), 'write', dev(p), wf] + wexp, cwd=wd)
     check("ap-param-apply write: heartbeats stop after the last PARAM_SET -> WARNING no heartbeat, 3 writes, exit 1, no REFUSED",
@@ -536,6 +569,19 @@ def main():
         check(f"{tool}: forged SIM_SPEEDUP from (2,1) on a non-SITL -> REFUSED, exit 2, nothing but PARAM_REQUEST_READ sent",
               rc == 2 and 'REFUSED' in out and set(p.seen) <= {'PARAM_REQUEST_READ'},
               f"rc {rc} {p.seen}\n{out}")
+    # sitl-flight-test: --vehicle copter against a fixed-wing heartbeat is refused before any mode or arm
+    p = peer(gps=True, echo_mode=True, mav_type=mavutil.mavlink.MAV_TYPE_FIXED_WING)
+    rc, out = p.run([py, T('sitl-flight-test.py'), '--vehicle', 'copter', '--device', dev(p)],
+                    timeout=40, cwd=wd)
+    check("sitl-flight-test --vehicle copter vs a fixed-wing heartbeat -> REFUSED, exit 2, nothing but PARAM_REQUEST_READ sent",
+          rc == 2 and 'REFUSED' in out and bool(p.seen) and set(p.seen) <= {'PARAM_REQUEST_READ'},
+          f"rc {rc} {p.seen}\n{out}")
+    # sitl-qhover-steps: a PWM out of range is a usage error before any MAVLink
+    p = peer(gps=True)
+    rc, out = p.run([py, T('sitl-qhover-steps.py'), '--climb-pwm', '2500', '--device', dev(p)],
+                    timeout=40, cwd=wd)
+    check("sitl-qhover-steps --climb-pwm 2500 -> usage error, exit 2, no MAVLink sent",
+          rc == 2 and '1000..2000' in out and not p.seen, f"rc {rc} {p.seen}\n{out}")
     # sitl-flight-test: forged ACK 400 + ARMED heartbeat while the real vehicle never acks
     p = peer(forge_arm=True, gps=True, echo_mode=True)
     rc, out = p.run([py, T('sitl-flight-test.py'), '--device', dev(p)], timeout=25, cwd=wd)

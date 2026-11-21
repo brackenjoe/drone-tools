@@ -52,6 +52,7 @@ nothing at all came back; 1 otherwise; 2 on a usage or connection error
         offline check of the parser and the summary line, no sockets; "N passed, M failed", exit 1 on a failure
 """
 import argparse
+import math
 import re
 import socket
 import struct
@@ -206,10 +207,18 @@ class Parser:
                   f"custom_mode {custom_mode}")
 
 
-def summary_line(p, got, seconds):
+def seconds_ok(v):
+    """--seconds must be finite and above 0 (0, negative and nan never listen, and inf
+    never ends, so --expect-none would pass vacuously)."""
+    return math.isfinite(v) and v > 0
+
+
+def summary_line(p, got, seconds, measured=False):
     """The summary line. Scripts may parse "N autopilot heartbeats, M armed" out of
-    it, so those words keep their place; the pin's parts come last."""
-    return (f"received {got} bytes in {seconds:g} s: {sum(p.counts.values())} frames, "
+    it, so those words keep their place; the pin's parts come last. measured: seconds
+    is the real time listened (a tcp server closed early), shown with one decimal."""
+    shown = f"{seconds:.1f}" if measured else f"{seconds:g}"
+    return (f"received {got} bytes in {shown} s: {sum(p.counts.values())} frames, "
             f"{p.hb} autopilot heartbeats, {p.armed_hb} armed" + (f", first at {p.first_hb:.2f} s" if p.first_hb is not None else "")
             + (f", {p.bad_hb_crc} heartbeat CRC failures" if p.bad_hb_crc else "")
             + (f", {p.junk} unframed bytes" if p.junk else "")
@@ -298,12 +307,25 @@ def _selftest():
     m = gate.match(line)
     case("n: a sed of the summary line reads the pinned N and M",
          bool(m) and m.groups() == ("1", "0") and line.endswith(", pinned to 1/1, 2 heartbeats from other sources ignored (1 armed)"), line)
+    for v in ("0", "-1", "nan"):
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["tcp", "127.0.0.1:1", "--seconds", v])
+        case(f"o: --seconds {v} is a usage error, exit 2", rc == 2, f"rc {rc}")
+    case("p: --seconds 5 and 0.5 accepted, inf refused",
+         seconds_ok(5.0) and seconds_ok(0.5) and not seconds_ok(float("inf")))
+    p = Parser()
+    line = summary_line(p, 0, 1.2345, measured=True)
+    case("q: early close shows measured time, one decimal", line.startswith("received 0 bytes in 1.2 s: "), line)
+    line = summary_line(p, 0, 5.0)
+    case("r: a full window shows the nominal --seconds", line.startswith("received 0 bytes in 5 s: "), line)
+    m = gate.match(summary_line(p, 0, 0.04, measured=True))
+    case("s: sed reads N and M with a measured time", bool(m) and m.groups() == ("0", "0"))
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=MODES,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", nargs="?", choices=["tcp", "udp-bind", "udp-probe"])
@@ -314,11 +336,14 @@ def main():
     ap.add_argument("--sysid", type=int, help="only heartbeats from this sysid count toward N and M (1-255); needs --compid")
     ap.add_argument("--compid", type=int, help="only heartbeats from this compid count toward N and M (1-255); needs --sysid")
     ap.add_argument("--expect-none", action="store_true", help="udp-probe: success is silence")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.selftest:
         return _selftest()
     if a.mode is None or a.addr is None:
         ap.error("the following arguments are required: mode, addr")
+    if not seconds_ok(a.seconds):
+        print("--seconds must be a finite number above 0", file=sys.stderr)
+        return 2
     if (a.sysid is None) != (a.compid is None):
         print("--sysid and --compid go together: give both or neither", file=sys.stderr)
         return 2
@@ -340,6 +365,7 @@ def main():
         p.pin = (a.sysid, a.compid)
     t0 = time.monotonic()
     got = 0
+    listened, measured = a.seconds, False
 
     if a.mode == "tcp":
         while True:
@@ -361,6 +387,9 @@ def main():
                 continue
             if not d:
                 print("connection closed by the server")
+                elapsed = time.monotonic() - t1
+                if elapsed < a.seconds:
+                    listened, measured = elapsed, True
                 break
             got += len(d)
             p.feed(d, time.monotonic() - t1)
@@ -395,7 +424,7 @@ def main():
         s.close()
 
     ids = ", ".join(f"{k}x{v}" for k, v in sorted(p.counts.items()))
-    print(summary_line(p, got, a.seconds))
+    print(summary_line(p, got, listened, measured))
     if len(p.sources) > 1:
         print("heartbeats by source: " + ", ".join(
             f"{s}/{c} type {t} autopilot {a} x{n}" for (s, c, t, a), n in sorted(p.sources.items())))

@@ -143,8 +143,9 @@ no heartbeat comes, it warns, says how many writes were made and exits 1.
 A write already sent cannot be undone.
 `--expect-git` is compared as an 8-character prefix of the firmware hash,
 which is shown with anything other than letters and digits as `?`.
-A `never-write.txt` beside a parameter file lists names or patterns that
-no file may set.
+A `never-write.txt` beside a parameter file (or beside the file a symlink
+points to) lists names or patterns that no file may set; one that exists but
+cannot be read refuses the run.
 
 **Which board it talks to.** It uses the first heartbeat it hears that is
 not from a ground station and not marked as a non-autopilot (as gimbals,
@@ -175,7 +176,7 @@ flight controller its own system id (`MAV_SYSID` from Copter 4.7,
     ap-ftp-get.py /APM/LOGS/00000011.BIN out/
     ap-ftp-get.py --list /APM/LOGS
     ap-ftp-get.py --last-log out/        # the log LASTLOG.TXT names
-    ap-ftp-get.py ... --device /dev/ttyACM0 --baud 115200 --stall 5 --max-mib 2048
+    ap-ftp-get.py ... --device /dev/ttyACM0 --baud 115200 --stall 5 --max-mib 2048 --timeout 600
     ap-ftp-get.py --selftest             # offline, stdlib only
 
 A directory given with a trailing `/`, or to `--last-log`, is created if
@@ -190,12 +191,14 @@ filters out other devices on a shared link (a ground station, a gimbal, a
 companion computer), but any sender can claim those ids, so it is not
 authentication. It stores a chunk only if the chunk lies inside the size the
 board announced, starts on a 239-byte boundary and carries as many bytes as
-its header says, and it refuses a file larger than `--max-mib` before
-allocating memory. `VERIFIED` means the board's CRC32 matches the bytes
+its header says, and it refuses a file larger than `--max-mib`. Memory
+grows with the chunks it accepts, not with the size announced (the final join briefly needs about twice the file size), and a
+download gives up after `--timeout` seconds (default 600). `VERIFIED` means the board's CRC32 matches the bytes
 received. That catches a corrupted transfer, but the CRC comes over the same
 link, so it does not prove the source. MAVLink signing would, and this tool
 neither signs nor checks signatures. On a CRC mismatch, or no CRC reply at
-all, the bytes are kept beside the target as `.crc-mismatch`. File
+all, the bytes are kept beside the target as `.crc-mismatch`. A --timeout reached before the CRC check keeps nothing. Both files are
+written to a temporary name in the same directory and then renamed. File
 names in `--list` output are printed with control characters shown as
 `\xNN` text.
 
@@ -301,8 +304,9 @@ has none, unless it runs one of ArduPilot's Sim-on-Hardware builds, which
 have `SIM_*` parameters and pass this check. It pins the first autopilot heartbeat and takes every reply,
 `SIM_SPEEDUP` and the arm ACK included, from that system and component
 only, and it arms only after a heartbeat confirms the mode (GUIDED, or
-TAKEOFF on a plane): an unconfirmed mode is exit 1. No heartbeat is a
-failure at once. `ap-version.py` reads
+TAKEOFF on a plane): an unconfirmed mode is exit 1. It refuses, exit 2, a vehicle whose heartbeat type is not a Copter frame type (multirotor, coaxial or helicopter) for copter, or a fixed-wing or VTOL type for plane. No heartbeat is a failure
+at once. After a failure once armed, it releases the RC override and, if the vehicle is still armed, asks for LAND (copter) or RTL
+(plane); it never disarms. `ap-version.py` reads
 `AUTOPILOT_VERSION` and prints the version, the git hash, the board id (as
 the other tools' `--expect-board` takes it), the uid, and the
 `git worktree add` line that pins a tree to that hash. A hash that is not
@@ -410,9 +414,11 @@ centred sticks, then land. It refuses to arm anything without a
 QHOVER is not confirmed, refuses a `--check-params` file with any line that
 is not `NAME VALUE` (or no parameter at all), refuses to fly if any of its
 parameters is missing or differs on the vehicle, removes an old
-`--phases-out` file before it starts, lands and fails if
-the climb does not reach `--alt` in time, and, only after a landing,
-writes each phase's start and end in the vehicle's own boot time. The
+`--phases-out` file before it starts (`--params-only` included), fails if
+the vehicle disarms or leaves QHOVER before the landing, and after any
+failure once armed it releases the stick overrides, and asks for QLAND if the vehicle is still armed. Only
+after a landing from a profile flown through does it print PASS and write
+each phase's start and end in the vehicle's own boot time. The
 metrics tool reads the dataflash log (`.bin`, or a text `.log`, opened as a
 log and never handed to pymavlink's connection logic), cuts it by those phases (or `--window`), and
 reports the yaw-rate tracking per step, the hands-off heading drift, the
@@ -444,7 +450,9 @@ streams, because on a real Plane that request is saved to its parameters.
 They pin the first autopilot heartbeat and take every reply from that system
 and component only. They exit 1 with a `FAIL` line on an unconfirmed mode
 change, a target altitude or mission item that is not reached, a failure to
-arm, and a vehicle still armed at the end. The parameter file has to be
+arm, and a vehicle still armed at the end. After any such failure once
+armed, they release the stick overrides and, if the vehicle is still armed, ask for LAND (copter), QLAND
+(quadplane) or RTL (fixed-wing); they never disarm in flight. The parameter file has to be
 loaded into SITL when it boots (`--add-param-file`, and `-w` to start from
 defaults); `--check-params` does not set anything, it reads every name in the
 file back off the vehicle before arming, prints what it got, and refuses to
@@ -670,7 +678,7 @@ What it does not do:
 
 ## Offline tests: test-fc-sender-checks.py, test-param-dump-health.py
 
-    python3 test-fc-sender-checks.py      # 46 cases, about 5 minutes
+    python3 test-fc-sender-checks.py      # 54 cases, about 6 minutes
     python3 test-param-dump-health.py     # 8 cases
 
 Each case runs one tool as a subprocess against a fake MAVLink peer on

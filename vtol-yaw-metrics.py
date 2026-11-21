@@ -35,6 +35,7 @@ Reads positions from nothing and prints none.
 """
 import argparse
 import json
+import math
 import os
 import sys
 import unicodedata
@@ -95,15 +96,30 @@ def load_log(path):
         mlog = DFReader.DFReader_text(path)
     data = {k: [] for k in WANT}
     params = {}
+    skipped = 0
     while True:
         msg = mlog.recv_match(type=list(WANT))
         if msg is None:
             break
         t = msg.get_type()
         if t == 'PARM':
-            params[msg.Name] = msg.Value
+            # a log's own FMT may declare Value as text: only finite numbers
+            # are kept, so no log text reaches the report
+            try:
+                if not isinstance(msg.Name, str):
+                    raise TypeError
+                val = float(msg.Value)
+                if not math.isfinite(val):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                skipped += 1
+                continue
+            params[msg.Name] = val
         else:
             data[t].append(msg.to_dict())
+    if skipped:
+        print(inert(f"warning: {skipped} log parameters were not finite numbers and were ignored"),
+              file=sys.stderr)
     return data, params
 
 
@@ -410,9 +426,11 @@ def print_report(out, name):
         h = out['heading_hold']
         print(f"  hold {h['seconds']} s: ATT.Yaw change {h['att_yaw_change_deg']:+.1f} deg, "
               f"integral of RATE.Y {h['rate_y_integral_deg']:+.1f} deg, end rate {h['end_rate_y_dps']:+.1f} deg/s")
+    imax = out['yaw_imax']
+    imax = f"{imax:g}" if isinstance(imax, (int, float)) and not isinstance(imax, bool) and math.isfinite(imax) else '-'
     for w, v in yo.items():
         print(f"  {w:10} YOut mean {v['yout_mean']:+.3f} max|{v['yout_max_abs']:.3f}|, "
-              f"I {v['i_start']:+.3f} -> {v['i_end']:+.3f} (max|{v['i_max_abs']:.3f}|, IMAX {out['yaw_imax']}), "
+              f"I {v['i_start']:+.3f} -> {v['i_end']:+.3f} (max|{v['i_max_abs']:.3f}|, IMAX {imax}), "
               f"yaw limit flag {v['yaw_limit_flag_pct']:.0f}%")
     for w, v in sat.items():
         print(f"  {w:10} motor at top {v['any_at_top_pct']:.1f}%, at bottom {v['any_at_bottom_pct']:.1f}%, "
@@ -620,6 +638,40 @@ def selftest():
           first == 'x\\x1b[31m\\x0ay')
     check("inert: U+202E and U+200B (Cf) come out as \\uXXXX, ESC still \\x1b",
           inert('a\u202eb\u200bc') == 'a\\u202eb\\u200bc' and inert('\x1b') == '\\x1b')
+    # a log whose own FMT declares PARM.Value as char[64]: text never loads
+    import struct
+
+    def rec(t, length, name, fmt, labels):
+        return b'\xa3\x95\x80' + struct.pack('<BB4s16s64s', t, length, name, fmt, labels)
+    pay = '\x1b[2J\x1b]0;X\x07'
+    raw = rec(128, 89, b'FMT', b'BBnNZ', b'Type,Length,Name,Format,Columns')
+    raw += rec(129, 91, b'PARM', b'QNZ', b'TimeUS,Name,Value')
+    raw += b'\xa3\x95\x81' + struct.pack('<Q16s64s', 1, b'ATC_RAT_YAW_IMAX', pay.encode())
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'c.bin')
+        with open(path, 'wb') as f:
+            f.write(raw)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            _, lp = load_log(path)
+    check(f"load_log: a text PARM value is not stored ({sorted(lp)})", 'ATC_RAT_YAW_IMAX' not in lp)
+    check(f"load_log: one warning line with a count, no raw control ({err.getvalue()!r})",
+          err.getvalue() == "warning: 1 log parameters were not finite numbers and were ignored\n")
+    d2, p2, ph2 = synthetic()
+    for bad in (pay, float('nan'), float('inf'), None):
+        p2['ATC_RAT_YAW_IMAX'] = bad
+        o2 = analyse(d2, p2, [2, 3], [1, 4], ph2)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            print_report(o2, 'n')
+        txt = buf.getvalue()
+        check(f"print_report: IMAX {bad!r:.12} prints no raw ESC or BEL, field is '-'",
+              '\x1b' not in txt and '\x07' not in txt and 'IMAX -)' in txt)
+    o2['yaw_imax'] = 0.5
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_report(o2, 'n')
+    check("print_report: numeric IMAX 0.5 prints its value", 'IMAX 0.5)' in buf.getvalue())
     real = getattr(np, 'trapezoid', None)
     made = not hasattr(np, 'trapz')
     try:

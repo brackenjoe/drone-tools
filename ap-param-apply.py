@@ -34,11 +34,14 @@ Files are Mission Planner "NAME,value" (MAVProxy "NAME value" also parses),
 '#' comments. With several files, a later file's value for a name wins over an
 earlier one's, and the plan says which file each value came from.
 
-Names someone else owns: if the directory of any given file holds a
-never-write.txt, every name or fnmatch pattern listed in it (one per line,
-'#' comments) is refused. A file that sets one refuses the whole run before
-anything connects, so a parameter file cannot carry a name its owner set by
-hand, whatever command line writes it.
+Names someone else owns: never-write.txt is looked up in the directory of
+each given file and in the directory of the file a symlink points to; every
+name or fnmatch pattern listed in it (one per line, '#' comments) is refused.
+Patterns match case-insensitively (names and patterns are compared
+upper-cased). A file that sets one refuses the whole run before anything
+connects, so a parameter file cannot carry a name its owner set by hand,
+whatever command line writes it. A list that exists but cannot be read
+refuses the run, exit 2.
 
 It never saves anything but the named parameters, never sends a heartbeat,
 and speaks as sysid 250 component 190, so it is never mistaken for the
@@ -52,24 +55,57 @@ mavutil.add_message, when a link switches from MAVLink 1 to 2; fixed in 2.4.50):
   ... write ... --log writes.tsv a.param b.param
   ... reboot tcp:127.0.0.1:5760 --expect-uid ... --expect-git ... --expect-board ...
 """
-import argparse, fnmatch, math, os, re, struct, sys, time
+import argparse, fnmatch, math, os, re, struct, sys, time, unicodedata
 
 mavutil = None  # imported in main() after the arguments, so --help needs no pymavlink
 
 
+def die(msg, code=2):
+    """A refusal that exits `code` (sys.exit(str) alone would exit 1)."""
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def _inert_char(c):
+    if c <= '\x1f' or '\x7f' <= c <= '\x9f':
+        return f"\\x{ord(c):02x}"
+    if unicodedata.category(c) in ('Cf', 'Zl', 'Zp'):   # bidi overrides, zero-width, U+2028/9
+        return f"\\u{ord(c):04x}"
+    return c
+
+
+def inert(s):
+    """s with every C0 control (newline too: one message stays one log line),
+    DEL and C1 control as \\xNN, and every format or line/paragraph separator
+    character as \\uXXXX, so a file name cannot forge a log line or move the cursor."""
+    return ''.join(_inert_char(c) for c in str(s))
+
+
 def never_write(paths):
-    """[(pattern, list file)] from a never-write.txt beside any of the files."""
+    """[(PATTERN, list file)] from a never-write.txt beside any of the files,
+    looked up in both the directory the path names and the directory its
+    symlinks resolve to (the union of patterns). A never-write.txt that exists
+    (a dangling symlink counts) but cannot be read refuses the run, exit 2."""
     out, seen = [], set()
-    for d in sorted({os.path.dirname(os.path.abspath(p)) for p in paths}):
+    dirs = set()
+    for p in paths:
+        dirs.add(os.path.dirname(os.path.abspath(p)))
+        dirs.add(os.path.dirname(os.path.realpath(p)))
+    for d in sorted(dirs):
         lock = os.path.join(d, 'never-write.txt')
-        if lock in seen or not os.path.exists(lock):
+        if lock in seen or not os.path.lexists(lock):
             continue
         seen.add(lock)
-        with open(lock) as fh:
-            for raw in fh:
-                pat = raw.split('#', 1)[0].strip()
-                if pat:
-                    out.append((pat, lock))
+        try:
+            with open(lock, encoding='utf-8-sig') as fh:
+                lines = fh.readlines()
+        except (OSError, UnicodeError) as e:
+            die(f"REFUSED: {inert(lock)} exists but cannot be read ({inert(e)}), "
+                f"so the names it protects are unknown")
+        for raw in lines:
+            pat = raw.split('#', 1)[0].strip().upper()
+            if pat:
+                out.append((pat, lock))
     return out
 
 
@@ -82,6 +118,8 @@ def fmt(v):
     if v is None:
         return '-'
     v = float(v)
+    if not math.isfinite(v):
+        return repr(v)
     if v == int(v) and abs(v) < 1e9:
         return str(int(v))
     return repr(f32(v))
@@ -90,31 +128,38 @@ def fmt(v):
 def read_files(paths):
     """[(name, value, file)], later files winning, order of first appearance."""
     order, vals = [], {}
+    ws = ' \t\r\n\f\v'
     for p in paths:
         with open(p) as fh:
             for n, raw in enumerate(fh, 1):
-                line = raw.split('#', 1)[0].strip()
+                line = raw.split('#', 1)[0].strip(ws)
                 if not line:
                     continue
-                parts = line.replace(',', ' ').split()
+                # ASCII whitespace and ',' only: no Unicode separator splits a field
+                parts = [x for x in re.split(r'[ \t\r\n\f\v,]+', line) if x]
                 if len(parts) != 2:
-                    sys.exit(f"{p}:{n}: cannot parse {raw.rstrip()!r}")
+                    sys.exit(f"{inert(p)}:{n}: cannot parse {raw.rstrip()!r}")
                 name, sval = parts
                 if not re.fullmatch(r'[A-Z0-9_]{1,16}', name):
-                    sys.exit(f"{p}:{n}: not a parameter name: {name!r}")
+                    sys.exit(f"{inert(p)}:{n}: not a parameter name: {name!r}")
+                if not re.fullmatch(r'[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?', sval):
+                    sys.exit(f"{inert(p)}:{n}: not a number: {sval!r}")
                 try:
                     val = float(sval)
                 except ValueError:
-                    sys.exit(f"{p}:{n}: not a number: {sval!r}")
+                    sys.exit(f"{inert(p)}:{n}: not a number: {sval!r}")
                 if not math.isfinite(val):
-                    sys.exit(f"{p}:{n}: {name} value is not finite: {sval!r}")
+                    sys.exit(f"{inert(p)}:{n}: {name} value is not finite: {sval!r}")
                 try:
                     struct.pack('<f', val)
                 except OverflowError:
-                    sys.exit(f"{p}:{n}: {name} value does not fit a float32: {sval!r}")
+                    sys.exit(f"{inert(p)}:{n}: {name} value does not fit a float32: {sval!r}")
                 if name not in vals:
                     order.append(name)
                 vals[name] = (val, p)
+    if not order:
+        die("REFUSED: no parameter in " + ', '.join(inert(p) for p in paths)
+            + " (only comments and blank lines): nothing to apply")
     return [(nm, vals[nm][0], vals[nm][1]) for nm in order]
 
 
@@ -166,6 +211,11 @@ def refuse_shared_sysid(uids, sysid, compid):
         sys.exit(f"REFUSED: {len(uids)} flight controllers answer as system {sysid} "
                  f"component {compid} on this link (uids {', '.join(uids)}). "
                  f"Give each its own system id (MAV_SYSID on 4.7, SYSID_THISMAV before 4.7).")
+
+
+class ArmedDuringWrite(Exception):
+    """The FC was seen armed between the tries of one write; the PARAM_SET
+    already sent is not repeated."""
 
 
 class FC:
@@ -246,7 +296,10 @@ class FC:
         return None
 
     def set(self, name, value, ptype, tries=3, timeout=2.0):
-        for _ in range(tries):
+        for attempt in range(tries):
+            # a PARAM_SET already went out: never send another once the FC is seen armed
+            if attempt and (self.armed_seen or self.armed_queued()):
+                raise ArmedDuringWrite(name)
             self.m.mav.param_set_send(self.sysid, self.compid, name.encode(), float(value), ptype)
             end = time.time() + timeout
             while time.time() < end:
@@ -341,8 +394,15 @@ def main():
         fc.m.mav.command_long_send(fc.sysid, fc.compid,
                                    mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 0,
                                    1, 0, 0, 0, 0, 0, 0)
-        ack = recv_from(fc.m, 'COMMAND_ACK', fc.sysid, fc.compid, 5,
-                        condition='COMMAND_ACK.command==246')
+        ack, end = None, time.time() + 5
+        while ack is None and end - time.time() > 0:
+            msg = recv_from(fc.m, 'COMMAND_ACK', fc.sysid, fc.compid, end - time.time(),
+                            condition='COMMAND_ACK.command==246')
+            if msg is None:
+                break
+            # addressed to us (250/190), or to nobody (0/0: MAVLink 1 has no target fields)
+            if (getattr(msg, 'target_system', 0), getattr(msg, 'target_component', 0)) in ((250, 190), (0, 0)):
+                ack = msg
         res = None if ack is None else ack.result
         print(f"reboot: ACK result {res} (0 = accepted)")
         return 0 if res == 0 else 1
@@ -353,7 +413,7 @@ def main():
     for name, before, _t, target, src in planned:
         same = before is not None and f32(before) == f32(target)
         tag = 'MISSING' if before is None else ('same' if same else 'CHANGE')
-        print(f"{name:{w}}  {fmt(before):>12}  {fmt(target):>12}  {src}  {tag}")
+        print(f"{name:{w}}  {fmt(before):>12}  {fmt(target):>12}  {inert(src)}  {tag}")
     if missing:
         sys.exit(f"REFUSED: not on this firmware: {', '.join(missing)}")
     changes = [r for r in planned if f32(r[1]) != f32(r[3])]
@@ -368,24 +428,38 @@ def main():
     stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     fails, wrote = [], 0
     print(f"\n{'name':{w}}  {'before':>12}  {'after':>12}")
-    for name, before, ptype, target, src in planned:
-        if f32(before) == f32(target):
-            after, status = before, 'unchanged'
-        else:
-            if fc.armed_queued():
-                if log:
-                    log.close()
-                print(f"wrote {wrote} of {len(changes)}; next was {name}")
-                sys.exit(f"STOPPED: the FC armed during the write after {wrote} of "
-                         f"{len(changes)} writes; next was {name}. The writes made cannot be undone.")
-            after = fc.set(name, target, ptype)
-            wrote += 1
-            status = 'ok' if after is not None and f32(after) == f32(target) else 'FAILED'
-            if status == 'FAILED':
-                fails.append(name)
-            print(f"{name:{w}}  {fmt(before):>12}  {fmt(after):>12}  {status}")
+    def stop(nxt, unconfirmed=None):
         if log:
-            log.write(f"{stamp}\t{v['uid']}\t{name}\t{fmt(before)}\t{fmt(target)}\t{fmt(after)}\t{status}\t{src}\n")
+            log.close()
+        print(f"wrote {wrote} of {len(changes)}; next was {nxt}")
+        sys.exit(f"STOPPED: the FC armed during the write after {wrote} of "
+                 f"{len(changes)} writes; next was {nxt}. The writes made cannot be undone."
+                 + (f" {unconfirmed} was sent and not confirmed." if unconfirmed else ''))
+
+    def logline(name, before, target, after, status, src):
+        if log:
+            log.write(f"{stamp}\t{v['uid']}\t{name}\t{fmt(before)}\t{fmt(target)}\t{fmt(after)}\t{status}\t{inert(src)}\n")
+            log.flush()
+
+    for k, (name, before, ptype, target, src) in enumerate(planned):
+        if f32(before) == f32(target):
+            logline(name, before, target, before, 'unchanged', src)
+            continue
+        if fc.armed_queued():
+            stop(name)
+        try:
+            after = fc.set(name, target, ptype)
+        except ArmedDuringWrite:
+            wrote += 1          # the PARAM_SET went out: it is a write made, and logged
+            logline(name, before, target, None, 'UNCONFIRMED', src)
+            nxt = next((r[0] for r in planned[k + 1:] if f32(r[1]) != f32(r[3])), '(none)')
+            stop(nxt, unconfirmed=name)
+        wrote += 1
+        status = 'ok' if after is not None and f32(after) == f32(target) else 'FAILED'
+        if status == 'FAILED':
+            fails.append(name)
+        logline(name, before, target, after, status, src)    # log first: a sent write is always logged
+        print(f"{name:{w}}  {fmt(before):>12}  {fmt(after):>12}  {status}")
     if log:
         log.close()
     # Heartbeats come about once a second, so on a fast link an arm in the last

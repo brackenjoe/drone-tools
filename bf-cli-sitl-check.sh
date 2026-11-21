@@ -31,7 +31,8 @@ if (exec 3<>/dev/tcp/127.0.0.1/5761) 2>/dev/null; then
     echo "something else holds TCP 5761 (the Betaflight SITL CLI port); stop it and rerun" >&2
     exit 2
 fi
-work=$(mktemp -d /tmp/bf-cli-check.XXXXXX)
+work=$(mktemp -d /tmp/bf-cli-check.XXXXXX) || { echo "cannot make scratch directory under /tmp" >&2; exit 2; }
+[ -n "$work" ] && [ -d "$work" ] || { echo "cannot make scratch directory under /tmp (empty path)" >&2; exit 2; }
 pass=0
 fail=0
 sitl_pid=

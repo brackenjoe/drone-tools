@@ -14,12 +14,14 @@ the version, GPS and PreArm requests and PARAM_REQUEST_LIST with hostile data:
   - a param name with a newline, and a NaN value: refused, exit 1, and an
     existing output file is unchanged
 
+The scratch directory is removed at the end; KEEP_SCRATCH=1 keeps it and prints its path.
+
 Run:  python3 test-param-dump-health.py [--tools DIR]   (needs pymavlink: requirements.txt)
 DIR (default: this file's directory) holds ap-param-dump.py, to run the same
 cases against an older revision. Prints PASS/FAIL per case and
 "N passed, M failed"; exits 1 on any failure.
 """
-import argparse, os, re, subprocess, sys, tempfile, threading, time
+import argparse, os, re, shutil, subprocess, sys, tempfile, threading, time
 
 os.environ['MAVLINK20'] = '1'
 from pymavlink import mavutil            # noqa: E402
@@ -137,9 +139,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--tools', default=os.path.dirname(os.path.abspath(__file__)))
     a = ap.parse_args()
+    wd = tempfile.mkdtemp(prefix='param-dump-health-')
+    try:
+        return cases(a, wd)
+    finally:
+        if os.environ.get('KEEP_SCRATCH') == '1':
+            print(f"scratch kept: {wd}")
+        else:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
+def cases(a, wd):
     tool = os.path.join(a.tools, 'ap-param-dump.py')
     py = sys.executable
-    wd = tempfile.mkdtemp(prefix='param-dump-health-')
     dev = lambda p: f'udpin:127.0.0.1:{p.port}'          # noqa: E731
     txt = lambda b: b.decode('latin1')                    # noqa: E731
 

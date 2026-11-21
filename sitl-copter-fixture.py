@@ -38,17 +38,29 @@ import time
 
 from pymavlink import mavutil
 
+
+def pos_float(s):
+    """argparse type: a finite number above 0 (durations, altitudes)."""
+    try:
+        v = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {s!r}")
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"must be finite and above 0, got {s!r}")
+    return v
+
+
 ap = argparse.ArgumentParser()
 ap.add_argument('--device', default='tcp:127.0.0.1:5760',
                 help='MAVLink connection string of the running SITL')
 ap.add_argument('--check-params', action='append', default=[],
                 help='parameter file whose every name must read back equal')
-ap.add_argument('--alt', type=float, default=15.0, help='takeoff altitude, m')
-ap.add_argument('--loiter-s', type=float, default=40.0,
+ap.add_argument('--alt', type=pos_float, default=15.0, help='takeoff altitude, m')
+ap.add_argument('--loiter-s', type=pos_float, default=40.0,
                 help='LOITER hold, wall-clock seconds')
-ap.add_argument('--althold-s', type=float, default=20.0,
+ap.add_argument('--althold-s', type=pos_float, default=20.0,
                 help='ALT_HOLD stick steps, wall-clock seconds')
-ap.add_argument('--guided-s', type=float, default=25.0,
+ap.add_argument('--guided-s', type=pos_float, default=25.0,
                 help='the two GUIDED yaw turns together, wall-clock seconds')
 ap.add_argument('--params-only', action='store_true',
                 help='check parameters and exit without flying')
@@ -86,6 +98,54 @@ def recv_from(m, types, sysid, compid, timeout, condition=None):
             return msg
 
 
+def parse_param_file(path):
+    """[(name, value)] from a parameter file, split like ArduPilot's
+    AP_Param::parse_param_line: tokens separated by any of ", =\t", and
+    an optional third token that must be @READONLY. A line that is neither
+    blank, a comment nor NAME VALUE [@READONLY] is refused with exit 2, naming
+    the line: a skipped line is a parameter the flight would silently not
+    check."""
+    out = []
+    try:
+        fh = open(path, encoding='utf-8')
+    except OSError as e:
+        sys.stderr.write(f"FAIL: cannot read {path!r}: {e}\n")
+        sys.exit(2)
+    with fh:
+        try:
+            lines = list(enumerate(fh, 1))
+        except UnicodeDecodeError:
+            sys.stderr.write(f"FAIL: {path!r}: not UTF-8 text\n")
+            sys.exit(2)
+        for n, line in lines:
+            line = line.split('#')[0].strip()
+            if not line:
+                continue
+            parts = [t for t in re.split('[, =\t]+', line) if t]
+            try:
+                if len(parts) == 3 and parts[2] == '@READONLY':
+                    parts = parts[:2]
+                if len(parts) != 2:
+                    raise ValueError
+                val = float(parts[1])
+                if not math.isfinite(val):
+                    raise ValueError
+            except ValueError:
+                sys.stderr.write(f"FAIL: {path!r}: line {n} is not NAME VALUE; "
+                                 "refusing to fly with a parameter file that is "
+                                 "not all read\n")
+                sys.exit(2)
+            out.append((parts[0], val))
+    if not out:
+        sys.stderr.write(f"FAIL: {path!r}: no parameter found\n")
+        sys.exit(2)
+    return out
+
+
+# Read before connecting: a bad file is exit 2 with nothing sent to the vehicle.
+PARAM_FILES = [(path, parse_param_file(path)) for path in a.check_params]
+
+
 try:
     m = mavutil.mavlink_connection(a.device, source_system=255)
 except OSError as e:
@@ -120,39 +180,6 @@ def read_param(name, timeout=8.0):
     return None, None
 
 
-def parse_param_file(path):
-    """[(name, value)] from a parameter file, split like ArduPilot's
-    AP_Param::parse_param_line: tokens separated by any of ", =\t", and
-    an optional third token that must be @READONLY. A line that is neither
-    blank, a comment nor NAME VALUE [@READONLY] is refused with exit 2, naming
-    the line: a skipped line is a parameter the flight would silently not
-    check."""
-    out = []
-    with open(path) as fh:
-        for n, line in enumerate(fh, 1):
-            line = line.split('#')[0].strip()
-            if not line:
-                continue
-            parts = [t for t in re.split('[, =\t]+', line) if t]
-            try:
-                if len(parts) == 3 and parts[2] == '@READONLY':
-                    parts = parts[:2]
-                if len(parts) != 2:
-                    raise ValueError
-                val = float(parts[1])
-                if not math.isfinite(val):
-                    raise ValueError
-            except ValueError:
-                sys.stderr.write(f"FAIL: {path!r}: line {n} is not NAME VALUE; "
-                                 "refusing to fly with a parameter file that is "
-                                 "not all read\n")
-                sys.exit(2)
-            out.append((parts[0], val))
-    if not out:
-        sys.stderr.write(f"FAIL: {path!r}: no parameter found\n")
-        sys.exit(2)
-    return out
-
 # This arms and flies. Only a SITL has SIM_* parameters.
 sim_speedup, _ = read_param('SIM_SPEEDUP')
 if sim_speedup is None:
@@ -169,8 +196,7 @@ m.mav.request_data_stream_send(SYS, COMP, mavutil.mavlink.MAV_DATA_STREAM_ALL, 5
 
 
 bad = []
-for path in a.check_params:
-    wanted = parse_param_file(path)
+for path, wanted in PARAM_FILES:
     print(f"\nchecking {len(wanted)} parameters from {path}", flush=True)
     for name, want in wanted:
         got, idx = read_param(name)
@@ -255,67 +281,102 @@ def hold(seconds, sticks=None):
         rxm(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
 
 
-set_mode('GUIDED')
-print("arming (retrying while prearm settles)...", flush=True)
-for _ in range(40):
-    r = cmd(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
-    if r and r.result == 0:
-        break
-    time.sleep(2)
-else:
-    sys.exit("FAIL: could not arm")
-print("  ARMED", flush=True)
+ARMED = [False]    # may be armed, and no disarm seen yet
+EVER_ARMED = [False]    # set when an arm was sent or seen; never cleared
 
-print(f"takeoff to {a.alt} m ...", flush=True)
-cmd(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, a.alt)
-peak = 0.0
-deadline = time.time() + 120
-while time.time() < deadline:
-    msg = rxm(type='GLOBAL_POSITION_INT', blocking=True, timeout=5)
-    if not msg:
-        continue
-    alt = msg.relative_alt / 1000.0
-    peak = max(peak, alt)
-    if alt >= a.alt * 0.95:
-        print(f"  reached {alt:.1f} m", flush=True)
-        break
-else:
-    sys.exit(f"FAIL: only reached {peak:.1f} m of {a.alt} m")
 
-# GUIDED manoeuvre: two 90 degree yaw turns, one each way, so the rate
-# controller and the mixer have a signal.
-print(f"GUIDED manoeuvre for {a.guided_s:.0f} s ...", flush=True)
-cmd(mavutil.mavlink.MAV_CMD_CONDITION_YAW, 90, 25, 1, 1)
-hold(a.guided_s / 2)
-cmd(mavutil.mavlink.MAV_CMD_CONDITION_YAW, 90, 25, -1, 1)
-hold(a.guided_s / 2)
+def failed_run():
+    """True while an exception other than a clean exit is leaving the run."""
+    e = sys.exc_info()[1]
+    return e is not None and not (isinstance(e, SystemExit) and e.code in (0, None))
 
-print(f"LOITER hold for {a.loiter_s:.0f} s ...", flush=True)
-set_mode('LOITER')
-rc(1500, 1500, 1500, 1500)
-hold(a.loiter_s, sticks=(1500, 1500, 1500, 1500))
 
-print(f"ALT_HOLD with stick input for {a.althold_s:.0f} s ...", flush=True)
-set_mode('ALT_HOLD')
-step = max(1.0, a.althold_s / 6)
-for ch1, ch2 in ((1560, 1500), (1500, 1560), (1440, 1500), (1500, 1440),
-                 (1500, 1500), (1500, 1500)):
-    hold(step, sticks=(ch1, ch2, 1500, 1500))
+def cleanup():
+    """After a failed run that ever armed: always release the RC override;
+    then, only if no disarm was seen, request LAND (not waited for). One try;
+    errors are swallowed with a note. Never disarms in flight."""
+    if not EVER_ARMED[0] or not failed_run():
+        return
+    try:
+        m.mav.rc_channels_override_send(SYS, COMP, 0, 0, 0, 0, 0, 0, 0, 0)
+        if ARMED[0]:
+            set_mode('LAND')
+            print("cleanup: overrides released and LAND requested after a failed run",
+                  flush=True)
+        else:
+            print("cleanup: overrides released after a failed run "
+                  "(vehicle already disarmed)", flush=True)
+    except (Exception, SystemExit) as e:
+        print(f"cleanup: could not finish ({e})", flush=True)
 
-print("landing ...", flush=True)
-rc(1500, 1500, 1500, 1500)
-set_mode('LAND')
-deadline = time.time() + 180
-while time.time() < deadline:
-    hb = rxm(type='HEARTBEAT', blocking=True, timeout=5)
-    if hb and not (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
-        print("  landed and disarmed", flush=True)
-        break
-else:
-    sys.exit("FAIL: still armed 180 s after LAND")
 
-# release the overrides so the log's RCIN goes back to the sim's own values
-m.mav.rc_channels_override_send(SYS, COMP,
-                                0, 0, 0, 0, 0, 0, 0, 0)
-time.sleep(3)
-print("\nPASS: fixture flight complete.")
+try:
+    set_mode('GUIDED')
+    print("arming (retrying while prearm settles)...", flush=True)
+    for _ in range(40):
+        r = cmd(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
+        if r is None or r.result == 0:
+            ARMED[0] = EVER_ARMED[0] = True      # an unanswered arm may still have taken
+        if r and r.result == 0:
+            break
+        time.sleep(2)
+    else:
+        sys.exit("FAIL: could not arm")
+    print("  ARMED", flush=True)
+
+    print(f"takeoff to {a.alt} m ...", flush=True)
+    cmd(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, a.alt)
+    peak = 0.0
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        msg = rxm(type='GLOBAL_POSITION_INT', blocking=True, timeout=5)
+        if not msg:
+            continue
+        alt = msg.relative_alt / 1000.0
+        peak = max(peak, alt)
+        if alt >= a.alt * 0.95:
+            print(f"  reached {alt:.1f} m", flush=True)
+            break
+    else:
+        sys.exit(f"FAIL: only reached {peak:.1f} m of {a.alt} m")
+
+    # GUIDED manoeuvre: two 90 degree yaw turns, one each way, so the rate
+    # controller and the mixer have a signal.
+    print(f"GUIDED manoeuvre for {a.guided_s:.0f} s ...", flush=True)
+    cmd(mavutil.mavlink.MAV_CMD_CONDITION_YAW, 90, 25, 1, 1)
+    hold(a.guided_s / 2)
+    cmd(mavutil.mavlink.MAV_CMD_CONDITION_YAW, 90, 25, -1, 1)
+    hold(a.guided_s / 2)
+
+    print(f"LOITER hold for {a.loiter_s:.0f} s ...", flush=True)
+    set_mode('LOITER')
+    rc(1500, 1500, 1500, 1500)
+    hold(a.loiter_s, sticks=(1500, 1500, 1500, 1500))
+
+    print(f"ALT_HOLD with stick input for {a.althold_s:.0f} s ...", flush=True)
+    set_mode('ALT_HOLD')
+    step = max(1.0, a.althold_s / 6)
+    for ch1, ch2 in ((1560, 1500), (1500, 1560), (1440, 1500), (1500, 1440),
+                     (1500, 1500), (1500, 1500)):
+        hold(step, sticks=(ch1, ch2, 1500, 1500))
+
+    print("landing ...", flush=True)
+    rc(1500, 1500, 1500, 1500)
+    set_mode('LAND')
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        hb = rxm(type='HEARTBEAT', blocking=True, timeout=5)
+        if hb and not (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+            print("  landed and disarmed", flush=True)
+            ARMED[0] = False
+            break
+    else:
+        sys.exit("FAIL: still armed 180 s after LAND")
+
+    # release the overrides so the log's RCIN goes back to the sim's own values
+    m.mav.rc_channels_override_send(SYS, COMP,
+                                    0, 0, 0, 0, 0, 0, 0, 0)
+    time.sleep(3)
+    print("\nPASS: fixture flight complete.")
+finally:
+    cleanup()

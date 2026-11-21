@@ -195,6 +195,7 @@ class PromptTimeout(NoLink):
     pass
 
 
+READ_CAP = 4 * 1024 * 1024  # bytes one CLI read may accumulate; a `diff all` or `dump all` is far under it
 NOREBOOT_FROM = (2025, 12)  # first date version with `exit noreboot` / `save noreboot`
 
 
@@ -232,7 +233,7 @@ class CLI:
 
     def _read_until_prompt(self, what, timeout=None):
         end = time.time() + (timeout or self.timeout)
-        buf, last = b'', time.time()
+        buf, last = bytearray(), time.time()
         while time.time() < end:
             try:
                 chunk = self.s.read(4096)
@@ -241,8 +242,11 @@ class CLI:
             if chunk:
                 buf += chunk
                 last = time.time()
+                if len(buf) > READ_CAP:
+                    raise NoLink(f"read more than {READ_CAP} bytes without a prompt while waiting for {what}: "
+                                 f"not a Betaflight CLI, or the link is streaming noise")
             elif buf.endswith(PROMPT) and time.time() - last > 0.25:
-                return buf.decode('latin-1')
+                return bytes(buf).decode('latin-1')
         raise PromptTimeout(f"timed out after {timeout or self.timeout:.0f}s waiting for the prompt after {what}")
 
     def enter(self):
@@ -273,7 +277,7 @@ class CLI:
             self.s.write(b'save\n')
         except (serial.SerialException, OSError) as e:
             raise NoLink(f"cannot write 'save': {e}")
-        buf, end, dropped, seen = b'', time.time() + wait, False, None
+        buf, end, dropped, seen = bytearray(), time.time() + wait, False, None
         while time.time() < end:
             try:
                 chunk = self.s.read(4096)
@@ -281,11 +285,13 @@ class CLI:
                 dropped = True
                 break
             buf += chunk or b''
+            if len(buf) > READ_CAP:
+                raise NoLink(f"read more than {READ_CAP} bytes while waiting for the reboot after `save`")
             if seen is None and b'saving' in buf:
                 seen = time.time()
             if seen is not None and time.time() - seen > 3:
                 break  # saved, the link is still up; the reconnect copes either way
-        text = buf.decode('latin-1')
+        text = bytes(buf).decode('latin-1')
         if ERROR_MARK in text:
             return False, text
         return (b'saving' in buf or dropped), text
@@ -743,8 +749,8 @@ def cmd_restore(a):
         if hdr['firmware'] != a.expect_version:
             problems.append(f"file header firmware {hdr['firmware']!r} != --expect-version {a.expect_version!r}")
     if emb and 'board' in hdr and (emb['board'], emb['version']) != (hdr['board'], hdr['firmware']):
-        problems.append(f"file's own version line says {emb['board']} {emb['version']}, header says "
-                        f"{hdr['board']} {hdr['firmware']}")
+        problems.append(f"file's own version line says {inert_line(emb['board'])} {inert_line(emb['version'])}, "
+                        f"header says {inert_line(hdr['board'])} {inert_line(hdr['firmware'])}")
     if problems:
         print("REFUSED: " + '; '.join(problems) + ". Nothing was sent.")
         return 1
@@ -1632,6 +1638,42 @@ def selftest():
         check("msp via main: unopenable port is exit 2", mrc == 2)
     finally:
         sys.argv, serial.serial_for_url = saved_argv, saved_sfu
+
+    # restore: ESC and BEL in the embedded version line, disagreeing with the header
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'x.txt')
+        with open(p, 'w', encoding='utf-8', newline='') as fh:
+            fh.write("# bf-cli.py diff all\n# firmware: 2026.6.2\n# board: SITL\n\n"
+                     "# Betaflight / SITL\x1b[2J\x1b]0;owned\x07 (SITL) 2026.6.2 Jun  1 2026 / 10:00:00 "
+                     "(abcdef0) MSP API: 1.47\nset craft_name = A\nsave\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rrc = cmd_restore(argparse.Namespace(file=p, expect_board='SITL', expect_version='2026.6.2', save=False))
+        o = buf.getvalue()
+        check("restore: version line with ESC and BEL that disagrees with the header is refused, rc 1, no raw control byte",
+              rrc == 1 and o.startswith('REFUSED') and not any(c in o for c in '\x1b\x07') and '\\x1b' in o, (rrc, o))
+
+    # _read_until_prompt stops at READ_CAP on a stream with no prompt
+    class Stream:
+        def read(self, n):
+            return b'x' * n
+
+    global READ_CAP
+    saved_cap, READ_CAP = READ_CAP, 65536
+    try:
+        c = CLI.__new__(CLI)
+        c.timeout, c.s = 30, Stream()
+        t0 = time.time()
+        try:
+            c._read_until_prompt('a stream')
+            err = None
+        except NoLink as e:
+            err = e
+        check("_read_until_prompt: a stream with no prompt stops at the cap with NoLink, quickly",
+              err is not None and not isinstance(err, PromptTimeout) and 'bytes without a prompt' in str(err)
+              and time.time() - t0 < 5, (err, time.time() - t0))
+    finally:
+        READ_CAP = saved_cap
 
     failed = results.count(False)
     print(f"{results.count(True)} passed, {failed} failed")

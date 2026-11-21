@@ -18,6 +18,12 @@ parameter is not SITL, and it refuses and exits 2. Exit 1 is a FAIL.
 Copter: GUIDED, arm, NAV_TAKEOFF, verify climb, LAND.
 Plane:  TAKEOFF mode, arm, verify climb, RTL. Planes do not land on command
         the way copters do, so the plane path stops once climb is proven.
+
+It refuses, exit 2, before any mode or arm, a vehicle whose heartbeat type is
+not the airframe --vehicle names (Copter frame types for copter; fixed wing or
+VTOL for plane). After a failed run in which it ever armed, it always releases
+the RC override and, only if no disarm was seen, requests LAND (copter) or RTL
+(plane); it never disarms. A passing run prints no cleanup line.
 """
 import sys, time, argparse
 from pymavlink import mavutil
@@ -76,7 +82,8 @@ try:
 except OSError as e:
     sys.exit(f"FAIL: no heartbeat on {a.device}: cannot connect ({e})")
 print(f"waiting for heartbeat ({a.vehicle}) ...")
-if pin_autopilot(m, 60) is None:
+pinned = pin_autopilot(m, 60)
+if pinned is None:
     sys.exit(f"FAIL: no heartbeat on {a.device}")
 SYS, COMP = m.target_system, m.target_component
 print(f"  system {SYS} component {COMP}")
@@ -114,6 +121,16 @@ if pv is None:
                      "This tool arms and takes off; it will not run against a real vehicle.\n")
     sys.exit(2)
 print(f"  SIM_SPEEDUP = {pv.param_value:g}: a SITL (or a Sim-on-Hardware build)")
+
+# The airframe has to be the one --vehicle names, or the flight path is wrong
+# for it: LAND on a plane, TAKEOFF mode on a copter. MAV_TYPE from the pinned
+# heartbeat; refused before any stream request, mode or arm.
+MAV_TYPES_OK = {'copter': (2, 3, 4, 13, 14, 15, 29, 35),    # Copter frame types: multirotors, coaxial, helicopter
+                'plane': (1, 19, 20, 21, 22, 23, 24, 25)}[a.vehicle]  # fixed wing, VTOL
+if pinned.type not in MAV_TYPES_OK:
+    sys.stderr.write(f"REFUSED: the autopilot's heartbeat says MAV_TYPE {pinned.type}, which is "
+                     f"not a {a.vehicle}. This tool arms and takes off; check --vehicle.\n")
+    sys.exit(2)
 
 # ArduPilot sends only HEARTBEAT until a GCS asks for streams. Asked for only
 # after the refusal above: on a real Plane REQUEST_DATA_STREAM is saved to the
@@ -164,57 +181,95 @@ if hb is None:
     sys.exit(f"FAIL: mode {mode} not confirmed; not arming")
 print(f"  mode = {mavutil.mode_string_v10(hb)}")
 
+ARMED = [False]    # may be armed, and no disarm seen yet
+EVER_ARMED = [False]    # set when an arm was sent or seen; never cleared
+
+
+def failed_run():
+    """True while an exception other than a clean exit is leaving the run."""
+    e = sys.exc_info()[1]
+    return e is not None and not (isinstance(e, SystemExit) and e.code in (0, None))
+
+
+def cleanup():
+    """After a failed run that ever armed: always release the RC override;
+    then, only if no disarm was seen, request LAND (copter) or RTL (plane).
+    One try; errors are swallowed with a note. Never disarms in flight. A
+    passing run, and the plane path's by-design RTL, print nothing."""
+    if not EVER_ARMED[0] or not failed_run():
+        return
+    name = 'LAND' if a.vehicle == 'copter' else 'RTL'
+    try:
+        m.mav.rc_channels_override_send(SYS, COMP, 0, 0, 0, 0, 0, 0, 0, 0)
+        if ARMED[0]:
+            if confirm_mode(MODES[name]) is None:
+                raise RuntimeError(f"mode {name} not confirmed")
+            print(f"cleanup: overrides released and {name} requested after a failed run")
+        else:
+            print("cleanup: overrides released after a failed run "
+                  "(vehicle already disarmed)")
+    except (Exception, SystemExit) as e:
+        print(f"cleanup: could not finish ({e})")
+
+
 print("arming (retrying while prearm settles)...")
-for _ in range(30):
-    r = cmd(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
-    if r and r.result == 0:
-        break
-    time.sleep(2)
-else:
-    sys.exit("FAIL: could not arm")
-print("  ARMED")
+try:
+    for _ in range(30):
+        r = cmd(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
+        if r is None or r.result == 0:
+            ARMED[0] = EVER_ARMED[0] = True      # an unanswered arm may still have taken
+        if r and r.result == 0:
+            break
+        time.sleep(2)
+    else:
+        sys.exit("FAIL: could not arm")
+    print("  ARMED")
 
-if a.vehicle == 'copter':
-    print(f"takeoff to {TGT}m...")
-    cmd(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0, TGT)
-else:
-    print(f"TAKEOFF mode should auto-climb; watching for {TGT}m...")
+    if a.vehicle == 'copter':
+        print(f"takeoff to {TGT}m...")
+        cmd(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0, TGT)
+    else:
+        print(f"TAKEOFF mode should auto-climb; watching for {TGT}m...")
 
-peak = 0.0
-deadline = time.time() + 90
-while time.time() < deadline:
-    msg = rx('GLOBAL_POSITION_INT', 5)
-    if not msg:
-        continue
-    alt = msg.relative_alt / 1000.0
-    peak = max(peak, alt)
-    if alt >= TGT * 0.95:
-        print(f"  reached {alt:.1f}m")
-        break
-else:
-    sys.exit(f"FAIL: only reached {peak:.1f}m of {TGT}m")
-
-if a.vehicle == 'copter':
-    print("landing...")
-    if confirm_mode(MODES['LAND']) is None:
-        print("  WARNING: mode LAND not confirmed")
+    peak = 0.0
     deadline = time.time() + 90
-    height = peak
     while time.time() < deadline:
-        msg = rx(['HEARTBEAT', 'GLOBAL_POSITION_INT'], 5)
-        if msg is None:
+        msg = rx('GLOBAL_POSITION_INT', 5)
+        if not msg:
             continue
-        if msg.get_type() == 'GLOBAL_POSITION_INT':
-            height = msg.relative_alt / 1000.0
-        elif not (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
-            print("  landed and disarmed")
+        alt = msg.relative_alt / 1000.0
+        peak = max(peak, alt)
+        if alt >= TGT * 0.95:
+            print(f"  reached {alt:.1f}m")
             break
     else:
-        sys.exit(f"FAIL: still armed and airborne at {height:.1f}m at the landing timeout")
-else:
-    if confirm_mode(MODES['RTL']) is None:
-        print("  WARNING: mode RTL not confirmed; climb proven")
-    else:
-        print("  RTL set; climb proven")
+        sys.exit(f"FAIL: only reached {peak:.1f}m of {TGT}m")
 
-print(f"\nPASS: {a.vehicle} SITL flew.")
+    if a.vehicle == 'copter':
+        print("landing...")
+        if confirm_mode(MODES['LAND']) is None:
+            print("  WARNING: mode LAND not confirmed")
+        deadline = time.time() + 90
+        height = peak
+        while time.time() < deadline:
+            msg = rx(['HEARTBEAT', 'GLOBAL_POSITION_INT'], 5)
+            if msg is None:
+                continue
+            if msg.get_type() == 'GLOBAL_POSITION_INT':
+                height = msg.relative_alt / 1000.0
+            elif not (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                print("  landed and disarmed")
+                ARMED[0] = False
+                break
+        else:
+            sys.exit(f"FAIL: still armed and airborne at {height:.1f}m at the landing timeout")
+    else:
+        if confirm_mode(MODES['RTL']) is None:
+            print("  WARNING: mode RTL not confirmed; climb proven")
+        else:
+            print("  RTL set; climb proven")
+        ARMED[0] = False     # the plane path ends with RTL set, by design
+
+    print(f"\nPASS: {a.vehicle} SITL flew.")
+finally:
+    cleanup()
