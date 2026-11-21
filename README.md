@@ -7,7 +7,8 @@ file (`sitl.sh` is one bash file), except that `ap-param-dump.py` needs
 needs `mavlink-slowlink.py` beside it. Clone the repo and run a tool
 with `python3`, for example `python3 log-fmt-diff.py OLD.BIN NEW.BIN`.
 Tested on Linux. `lua/` holds an ArduPilot Lua script, which runs on the
-flight controller, not here.
+flight controller, not here. `examples/` holds the parameter files the SITL
+fixture tools use (see below).
 
 ## Requirements
 
@@ -49,6 +50,8 @@ to 2 (fixed upstream in 2.4.50).
 | `ap-mag-cal.py` | ArduPilot's onboard compass calibration driven over MAVLink, pinned to one board by its USB serial, firmware hash and board id like `ap-param-apply.py`: `start` runs it with the offsets not autosaved and prints the full report, `accept` saves them and reads the offsets back per compass, `cancel` discards the fit. `start` and `accept` refuse while the vehicle is armed. `start` itself saves `COMPASS_LEARN=0` and latches a reboot requirement; the tool says so. | pymavlink |
 | `ap-heading-watch.py` | Read-only, once a second: the EKF's yaw beside the compass heading computed from the raw field, the field strength, the EKF flags and compass variance, the GPS fix and satellite count (never a position); optional CSV and a gyro-only yaw for a box that stands still. `--selftest` checks the heading arithmetic. | pymavlink (not for `--selftest`) |
 | `sitl-qhover-steps.py` | Flies an already-running SITL quadplane or copter tailsitter a hover-only step profile (climb, hands-off hold, yaw steps, roll and pitch steps, land) and writes each phase's start and end in vehicle time, so a log can be cut by phase. Refuses to arm anything that is not SITL, and to fly if the parameters you name are not on the vehicle; fails if the climb does not reach its target. | pymavlink |
+| `sitl-copter-fixture.py` | Flies an already-running SITL copter the shape a log-analysis test fixture needs, for a log analyser's tests: GUIDED arm, takeoff, a GUIDED yaw turn each way, a LOITER hold, ALT_HOLD with roll and pitch stick steps, land. `--check-params FILE` reads every name in a parameter file back off the vehicle before arming and refuses to fly on a mismatch or a name the firmware does not have; `--params-only` stops after that check. Refuses to run on a vehicle with no `SIM_SPEEDUP` parameter, `--params-only` included. | pymavlink |
+| `sitl-plane-fixture.py` | The same for an already-running SITL ArduPlane, as a separate tool because a plane cannot be flown the copter way. `--profile fixedwing` (AUTO takeoff and three waypoints, FBWB stick steps, CRUISE, LOITER, RTL, AUTO landing), `quadplane` (replaces the AUTO takeoff and landing with QSTABILIZE and QHOVER at the start and QLOITER and QLAND at the end, with the forward and back transitions between) or `autotune` (AUTOTUNE flown with stick reversals, each axis until the firmware reports it Finished or `--axis-cap-s` runs out). `--check-params FILE` and `--params-only` as above. Refuses to run on a vehicle with no `SIM_SPEEDUP` parameter, `--params-only` included. | pymavlink |
 | `vtol-yaw-metrics.py` | Yaw-authority metrics off a hover log: does the yaw rate follow its demand, how far does heading drift hands-off, how hard is the yaw controller working, are the motors saturating, and what the CW-minus-CCW motor split answers to (yaw, roll or pitch demand), with the motors named by number as the props are built. `--selftest` runs on synthetic rows. | pymavlink, numpy |
 | `bf-cli.py` | Drives a Betaflight flight controller's CLI headlessly over USB serial or SITL: identify, backup, `set` lines read back, and a restore pinned to board and firmware. Never saves unless asked. `msp` reads why the board will not arm over MSP, without entering the CLI. | `pyserial` |
 | `bf-settings-diff.py` | Compares the settings tables of two Betaflight builds and classifies each line of a `diff all` backup against the newer one: `same`, `changed`, `missing`, `invalid` or `unchecked`, with `by-hand` for lines that are not settings (feature, serial, aux, resource). Offline; it reads text and touches no serial port. | stdlib |
@@ -419,6 +422,76 @@ CW-minus-CCW motor split (motors named by number as the props are built,
 split that loads on the yaw output means differential torque is the yaw
 actuator; one that loads on roll means a roll demand also moves the
 yaw-axis split. Positions are never read. Needs numpy.
+
+## SITL fixture flights: sitl-copter-fixture.py and sitl-plane-fixture.py
+
+    # sitl.sh runs from the ArduPilot tree, so --add-param-file needs an absolute path.
+    # AP_TREES is the directory holding the version-matched trees (see the SITL section above).
+    AP_TREES=/path/to/trees ./sitl.sh 4.7.1 ArduCopter --no-mavproxy -f freestyle -w --add-param-file="$PWD/examples/copter-sitl-4.7.1.parm"
+    python3 sitl-copter-fixture.py --check-params examples/copter-sitl-4.7.1.parm
+
+    AP_TREES=/path/to/trees ./sitl.sh 4.7.1 ArduPlane --no-mavproxy -f quadplane -w --speedup 1 --add-param-file="$PWD/examples/plane-default-logbitmask.parm"
+    python3 sitl-plane-fixture.py --profile quadplane --check-params examples/plane-default-logbitmask.parm
+
+Both need SITL already running with MAVProxy off (`--no-mavproxy`, or point
+them at `tcp:127.0.0.1:5762` with `--device`) and talk to it over MAVLink
+directly. They arm and fly, so before anything else, `--params-only`
+included, they read `SIM_SPEEDUP` back and refuse, exit 2, on a vehicle that
+has none. A real vehicle has none, unless it runs one of ArduPilot's
+Sim-on-Hardware builds, which have `SIM_*` parameters and pass this check; do
+not point these tools at one. The refusal comes before they request data
+streams, because on a real Plane that request is saved to its parameters.
+They pin the first autopilot heartbeat and take every reply from that system
+and component only. They exit 1 with a `FAIL` line on an unconfirmed mode
+change, a target altitude or mission item that is not reached, a failure to
+arm, and a vehicle still armed at the end. The parameter file has to be
+loaded into SITL when it boots (`--add-param-file`, and `-w` to start from
+defaults); `--check-params` does not set anything, it reads every name in the
+file back off the vehicle before arming, prints what it got, and refuses to
+fly if a name is unknown to the firmware or holds a different value. A line
+that is not `NAME VALUE` is refused, exit 2. That is the guard for a version
+bump: a renamed parameter loads as nothing, so the flight is silently wrong
+rather than failing.
+
+The tools write no parameters themselves, but the firmware does: it saves
+tuned gains during and after an `autotune` flight, and every plane profile
+overwrites the vehicle's stored mission. Launch with `-w` for a clean start,
+and do not reuse the `eeprom.bin` of an autotune run.
+
+The hold durations (`--loiter-s`, `--althold-s`, `--guided-s`; for the plane
+`--fbwb-s`, `--cruise-s`, `--loiter-s`, `--rtl-s`, `--qhover-s`,
+`--qloiter-s`) are wall clock, not simulated time: at `--speedup 2` a 40 s
+loiter is 80 s of log. Fly at `--speedup 1` if the stated durations are to
+mean what they say. The plane's AUTO legs are distance driven and unaffected.
+
+The plane tool builds its mission from the vehicle's own `HOME_POSITION`, so
+it follows whatever home SITL booted at. It confirms each mode change on
+`HEARTBEAT.custom_mode` against the numbers in `ArduPlane/mode.h`, not on a
+pymavlink mode string. Whatever the parameter file says, it reads `LOG_BITMASK`
+and `Q_ENABLE` off the vehicle and prints them, and a profile that disagrees
+with `Q_ENABLE` refuses to fly: `sim_vehicle.py`'s `eeprom.bin` survives
+between runs, so the frame flown second inherits the first frame's stored
+value unless SITL was launched with `-w`. The `autotune` profile exists
+because Plane's AutoTune learns only from attitude demands the pilot makes;
+mode 8 with centred sticks behaves like FBWA and makes no progress. It never
+leaves mode 8 until each axis has reported Finished or its `--axis-cap-s`
+(default 360 s) is up, so a PASS does not mean the tune converged: read the
+per-axis line it prints.
+
+`examples/` holds the parameter files the examples above name:
+
+- `copter-sitl-4.6.3.parm` and `copter-sitl-4.7.1.parm`: a SITL 5 inch quad
+  on 6S, built from ArduPilot's freestyle SITL model (`-f freestyle`), with
+  logging set to the batch sampler and the harmonic notch on. The pair
+  differs only in the four names in these files that 4.7 renames
+  (`ANGLE_MAX` to `ATC_ANGLE_MAX`, `WPNAV_ACCEL` to `WP_ACC`, `WPNAV_JERK` to
+  `WP_JERK`, `SIM_GPS_NUMSATS` to `SIM_GPS1_NUMSATS`), so the same flight can
+  be flown on both firmwares. Checking the 4.6.3 file against a 4.7.1 vehicle
+  refuses, which is the point.
+- `plane-default-logbitmask.parm`: `LOG_BITMASK 65535`, Plane 4.7.1's default
+  (`DEFAULT_LOG_BITMASK` 0xffff in `ArduPlane/config.h`). SITL's `-f plane`
+  already boots at 65535; it matters on `-f quadplane` loaded with
+  `--add-param-file`, because ArduPilot's `quadplane.parm` sets 65534.
 
 ## bf-cli.py
 

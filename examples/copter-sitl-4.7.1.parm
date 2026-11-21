@@ -1,0 +1,83 @@
+# Boot parameters for a SITL 5 inch quad on 6S, Copter 4.7.1, built from
+# ArduPilot's freestyle SITL model.
+#
+# The pair of copter-sitl-4.6.3.parm: the same flight profile and the same
+# logging set, so a log from each can be compared with only the firmware
+# different. The two files differ only in the four names in these files that
+# 4.7 renames, which are written here as 4.7.1 has them:
+#   ATC_ANGLE_MAX    30 deg      (4.6.3: ANGLE_MAX 3000 cdeg)
+#   WP_ACC           2.5 m/s/s   (4.6.3: WPNAV_ACCEL 250 cm/s/s)
+#   WP_JERK          2           (4.6.3: WPNAV_JERK 2)
+#   SIM_GPS1_NUMSATS 16          (4.6.3: SIM_GPS_NUMSATS 16)
+# SIM_GPS_NUMSATS does not exist at 4.7.1: the old name loads as nothing and
+# the simulator flies on its default satellite count.
+#
+# Logging is the batch sampler with the harmonic notch on (not the raw gyro
+# stream), which keeps a 125 s flight near 30 MB. MASK_LOG_* bit numbers are
+# unchanged at 4.7.1, so LOG_BITMASK carries over as is.
+#
+# Boot SITL with this file loaded, then check it took. Run from the repository
+# root; sitl.sh runs from the ArduPilot tree, so --add-param-file needs an
+# absolute path (the README has the AP_TREES setting):
+#   AP_TREES=/path/to/trees ./sitl.sh 4.7.1 ArduCopter --no-mavproxy -f freestyle -w --add-param-file="$PWD/examples/copter-sitl-4.7.1.parm"
+#   python3 sitl-copter-fixture.py --check-params examples/copter-sitl-4.7.1.parm
+# --check-params reads every name back off the vehicle before arming.
+LOG_BITMASK      136957
+INS_RAW_LOG_OPT  0
+INS_LOG_BAT_MASK 1
+# bit 2 = "Sample pre- and post-filter", alternating (BatchSampler.cpp:28)
+INS_LOG_BAT_OPT  4
+INS_LOG_BAT_CNT  1024
+INS_LOG_BAT_LGIN 20
+INS_LOG_BAT_LGCT 32
+LOG_DISARMED     0
+LOG_FILE_RATEMAX 0
+# one EKF core on IMU1, so the notch and the logged gyro are the same IMU
+EK3_IMU_MASK     1
+# the notch on, in ESC telemetry mode, so a log has a notch to analyse
+INS_HNTCH_ENABLE 1
+INS_HNTCH_MODE   3
+INS_HNTCH_REF    1
+INS_HNTCH_FREQ   150
+INS_HNTCH_BW     75
+INS_HNTCH_ATT    40
+INS_HNTCH_HMNCS  3
+INS_HNTCH_OPTS   0
+INS_HNTC2_ENABLE 0
+# motors: spin range and starting hover throttle chosen for this file (the
+# stock freestyle model sets 0.01 and 0.125); learn hover throttle, do not
+# save it
+MOT_SPIN_MIN     0.05
+MOT_SPIN_ARM     0.03
+MOT_THST_HOVER   0.15
+MOT_HOVER_LEARN  1
+# chosen simulation values: a gentler lean limit than the freestyle model's
+# 70 degrees and modest waypoint acceleration, a slower-response profile
+ATC_ANGLE_MAX    30
+WP_ACC           2.5
+WP_JERK          2
+LOIT_ANG_MAX     20
+# pack: chosen simulation values, 6S and 5000 mAh (the freestyle model's own
+# pack is 1300 mAh); the thresholds below are set to match
+BATT_CAPACITY    5000
+BATT_LOW_VOLT    19.2
+BATT_CRT_VOLT    0
+BATT_FS_VOLTSRC  1
+BATT_LOW_TIMER   10
+BATT_FS_LOW_ACT  0
+# SERIALn_PROTOCOL 16 is ESC telemetry; the port is one nothing listens on
+SERIAL5_PROTOCOL 16
+# the radio failsafe; no receiver simulation on this flight
+RSSI_TYPE        0
+FS_THR_ENABLE    1
+FS_GCS_ENABLE    0
+# SITL: 16 satellites is a healthy GPS; motor vibration so ESC RPM and a
+# gyro peak exist
+SIM_GPS1_NUMSATS 16
+SIM_VIB_MOT_MAX  560
+SIM_VIB_MOT_MULT 1
+SIM_VIB_MOT_HMNC 1
+SIM_GYR1_RND     10
+SIM_ACC1_RND     3
+SIM_ESC_TELEM    1
+SIM_BATT_VOLTAGE 25.2

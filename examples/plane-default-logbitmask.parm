@@ -1,0 +1,6 @@
+# Plane 4.7.1's default log bitmask, written out so --check-params can prove it.
+# DEFAULT_LOG_BITMASK is 0xffff (ArduPlane/config.h), and SITL's -f plane model
+# file (models/plane.parm) already sets 65535. It matters on -f quadplane
+# loaded with --add-param-file: ArduPilot's quadplane.parm sets 65534, and this
+# file puts the default back.
+LOG_BITMASK 65535

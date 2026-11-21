@@ -195,8 +195,6 @@ def rx(types, timeout):
     return recv_from(m, types, SYS, COMP, timeout)
 
 
-m.mav.request_data_stream_send(SYS, COMP, mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
-
 last_boot_ms = [None]
 
 
@@ -241,6 +239,10 @@ if sim_speedup is None:
                      "vehicle.\n")
     sys.exit(2)
 print(f"SIM_SPEEDUP = {sim_speedup:g}: a SITL (or a Sim-on-Hardware build)", flush=True)
+
+# Streams are asked for only after the refusal: on a real Plane
+# REQUEST_DATA_STREAM is saved to the stream-rate parameters.
+m.mav.request_data_stream_send(SYS, COMP, mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
 
 bad = []
 for path, wanted in PARAM_FILES:

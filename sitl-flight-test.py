@@ -98,11 +98,6 @@ def set_mode(num):
 # ArduCopter and ArduPlane custom_mode numbers (Mode::Number in mode.h).
 MODES = {'copter': {'GUIDED': 4, 'LAND': 9}, 'plane': {'TAKEOFF': 13, 'RTL': 11}}[a.vehicle]
 
-# ArduPilot sends only HEARTBEAT until a GCS asks for streams.
-m.mav.request_data_stream_send(SYS, COMP,
-                               mavutil.mavlink.MAV_DATA_STREAM_ALL, 5, 1)
-print("requested data streams")
-
 # This arms and takes off. Only a SITL has SIM_* parameters.
 pv = None
 for _ in range(3):
@@ -119,6 +114,13 @@ if pv is None:
                      "This tool arms and takes off; it will not run against a real vehicle.\n")
     sys.exit(2)
 print(f"  SIM_SPEEDUP = {pv.param_value:g}: a SITL (or a Sim-on-Hardware build)")
+
+# ArduPilot sends only HEARTBEAT until a GCS asks for streams. Asked for only
+# after the refusal above: on a real Plane REQUEST_DATA_STREAM is saved to the
+# stream-rate parameters.
+m.mav.request_data_stream_send(SYS, COMP,
+                               mavutil.mavlink.MAV_DATA_STREAM_ALL, 5, 1)
+print("requested data streams")
 
 print("waiting for GPS 3D fix (up to 120s)...")
 deadline = time.time() + 120
