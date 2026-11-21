@@ -122,6 +122,17 @@ def clean(data):
     return not CTRL.search(data)
 
 
+POS_KEYS = [str(abs(v))[:6].encode() for v in (LAT, LON)]
+
+
+def shows_position(b, need=any):
+    """True if b carries the fake position under any label: with the dots removed,
+    both the raw-integer and the decimal-degree forms hold the leading digits.
+    need=all asks for both coordinates."""
+    b = b.replace(b'.', b'')
+    return need(k in b for k in POS_KEYS)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--tools', default=os.path.dirname(os.path.abspath(__file__)))
@@ -146,11 +157,12 @@ def main():
     has_gps = b'GPS fix_type=3 satellites=12' in hs
     check("health: default GPS line has fix_type and satellites", rc == 0 and has_gps,
           txt(so))
-    check("health: default file and stdout hold no lat= or lon= field",
-          rc == 0 and has_gps and not re.search(rb'\b(lat|lon)=', hs + so), txt(so))
+    check("health: default file and stdout hold no position, by label or by digits",
+          rc == 0 and has_gps and not re.search(rb'\b(lat|lon)=', hs + so)
+          and not shows_position(hs + so), txt(so))
     rc2, so2, hs2 = dump(peer(), ['--health-position'])
-    check("health: --health-position puts lat= and lon= in the file",
-          rc2 == 0 and b'lat=' in hs2 and b'lon=' in hs2, txt(so2))
+    check("health: --health-position puts lat= and lon= in the file, and both coordinates' digits",
+          rc2 == 0 and b'lat=' in hs2 and b'lon=' in hs2 and shows_position(hs2, all), txt(so2))
 
     # escaping (the first run's output)
     check("health: no raw control byte in stdout or file",

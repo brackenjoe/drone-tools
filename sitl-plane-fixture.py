@@ -89,8 +89,23 @@ import math
 import re
 import sys
 import time
+import unicodedata
 
 from pymavlink import mavutil
+
+
+def inert(s):
+    """s with every C0 control (newline too), DEL and C1 control as \\xNN, and
+    every format, line or paragraph separator character as \\uXXXX, so
+    text from the vehicle cannot move the cursor, recolour the terminal or
+    start a new line."""
+    def esc(c):
+        cat = unicodedata.category(c)
+        if cat == 'Cc':
+            return f"\\x{ord(c):02x}"
+        # Cf (bidi overrides, zero-width, soft hyphen), Zl, Zp: invisible too
+        return f"\\u{ord(c):04x}" if cat in ('Cf', 'Zl', 'Zp') else c
+    return ''.join(esc(c) for c in str(s))
 
 # ArduPlane/mode.h at Plane-4.7.1 (dbe79216), read from the tree rather than
 # recalled: the Q modes in particular move between releases.
@@ -573,8 +588,9 @@ def arm():
         while time.time() < end:
             st = rxm(type='STATUSTEXT', blocking=True, timeout=1)
             if st and ('rm:' in st.text or 'rm :' in st.text):
-                if st.text != why:
-                    why = st.text
+                t = inert(st.text)
+                if t != why:
+                    why = t
                     print(f"    {why}", flush=True)
     sys.exit(f"FAIL: could not arm{': ' + why if why else ''}")
 
@@ -626,6 +642,7 @@ def pump(seconds, sticks, want=None, t0=None):
         if isinstance(text, bytes):
             text = text.decode('ascii', 'replace')
         text = text.strip('\x00').strip()
+        text = inert(text)
         el = time.time() - t0 if t0 else 0.0
         STATUS_LOG.append((el, msg.severity, text))
         print(f"    [{el:7.1f}s] sev {msg.severity}: {text}", flush=True)

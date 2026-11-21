@@ -26,8 +26,10 @@ does not shows the forged one.
   ap-version.py       (also) a non-hex git hash with ESC and LF printed escaped, no worktree
                       line, exit 1
   sitl-flight-test.py,
-  sitl-qhover-steps.py  a forged SIM_SPEEDUP from another system on a non-SITL refuses, exit 2,
-                      nothing reaches the vehicle; sitl-flight-test: a forged COMMAND_ACK 400
+  sitl-qhover-steps.py,
+  sitl-copter-fixture.py,
+  sitl-plane-fixture.py  a forged SIM_SPEEDUP from another system on a non-SITL refuses, exit 2,
+                      nothing but PARAM_REQUEST_READ reaches the vehicle; sitl-flight-test: a forged COMMAND_ACK 400
                       and ARMED heartbeat from another system never lead to a takeoff
                       (the fake echoes DO_SET_MODE, as the tool confirms GUIDED before arming);
                       a fake that ignores DO_SET_MODE: exit 1, "not confirmed", no arm command
@@ -36,7 +38,7 @@ does not shows the forged one.
                       first; the tool pins (1,1) (requests go there, the real value shows)
 
 Run:  python3 test-fc-sender-checks.py [--tools DIR]   (needs pymavlink: requirements.txt)
-DIR (default: this file's directory) holds the eight tools, to run the same
+DIR (default: this file's directory) holds the ten tools, to run the same
 cases against a copy of an older revision. Prints PASS/FAIL per case and
 "N passed, M failed"; exits 1 on any failure.
 """
@@ -525,11 +527,14 @@ def main():
           and 'not a hex hash' in out and 'worktree add' not in out, f"rc {rc}\n{out!r}")
 
     # SITL tools: a forged SIM_SPEEDUP on a vehicle that has none
-    for tool in ('sitl-flight-test.py', 'sitl-qhover-steps.py'):
+    # The fixtures take about 8 s to refuse once the heartbeat is pinned; 40 s covers them.
+    # The only thing a tool may send before refusing is PARAM_REQUEST_READ.
+    for tool in ('sitl-flight-test.py', 'sitl-qhover-steps.py',
+                 'sitl-copter-fixture.py', 'sitl-plane-fixture.py'):
         p = peer(sim=False, forge_speedup=True, gps=True)
         rc, out = p.run([py, T(tool), '--device', dev(p)], timeout=40, cwd=wd)
-        check(f"{tool}: forged SIM_SPEEDUP from (2,1) on a non-SITL -> REFUSED, exit 2, nothing sent to (1,1)",
-              rc == 2 and 'REFUSED' in out and not {'CMD400', 'CMD176', 'SET_MODE', 'CMD22'} & set(p.seen),
+        check(f"{tool}: forged SIM_SPEEDUP from (2,1) on a non-SITL -> REFUSED, exit 2, nothing but PARAM_REQUEST_READ sent",
+              rc == 2 and 'REFUSED' in out and set(p.seen) <= {'PARAM_REQUEST_READ'},
               f"rc {rc} {p.seen}\n{out}")
     # sitl-flight-test: forged ACK 400 + ARMED heartbeat while the real vehicle never acks
     p = peer(forge_arm=True, gps=True, echo_mode=True)
