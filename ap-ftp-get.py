@@ -20,7 +20,32 @@ re-asks from the first gap when a burst ends or stalls.
 VERIFIED means the board's CRC matches the bytes received from the heartbeat
 peer. It is a transport check (nothing was lost or reordered), not proof of the
 source: anything that can inject MAVLink on the link and speak as the vehicle can
-satisfy it. Replies are accepted only from the system and component of the
+satisfy it. CRC MISMATCH means the board answered with a CRC that differs from
+the local one (bytes kept as LOCAL.crc-mismatch); it is only ever printed with
+two real values. UNVERIFIED means no comparison was made: the board did not
+answer in time, refused, sent a short reply, or --no-crc was given (bytes kept
+as LOCAL.unverified). Exit codes: 0 VERIFIED, 1 failure or MISMATCH, 3
+UNVERIFIED. The download is written to LOCAL.unverified before the CRC is
+asked for and renamed to LOCAL only on a match, so a Ctrl-C or a dropped
+tunnel during the wait keeps it.
+
+The board computes CalcFileCRC32 in its only FTP worker thread, reading the
+whole file in 64-byte pieces, and answers nothing else until it is done
+(libraries/GCS_MAVLink/GCS_FTP.cpp, AP_Filesystem::crc32, ArduPilot 4.7.1
+dbe79216), and MAVFTP is silent meanwhile. On a TBS Lucid H7 (4.7.1
+dbe79216) a 218 MB log got no CRC reply within the old tool's 180 s
+(2026-11-22); the board's rate is not yet measured, so the default wait,
+twice the download time, is an estimate. A log still being written grows
+between the download and the CRC, so its CRC cannot match: fetch a closed
+log. A request with a new seq makes it compute again;
+a request whose seq is the last one's (request seq + 1 == the cached reply's
+seq) is answered from the cached reply without recomputing. So the CRC is
+asked for once, re-sent with the same seq only to cover a lost packet, and
+the wait (--crc-wait) is separate from --timeout, which bounds the download.
+After a timeout the FC stays busy until its CRC finishes: wait before the next
+MAVFTP command. Only a reply with seq == request seq + 1 is taken.
+
+Replies are accepted only from the system and component of the
 first autopilot heartbeat seen on the link, and only when addressed to this
 connection; the rest are skipped and counted. That filters out other devices
 on a shared link (a ground station, a gimbal, a companion computer), but any
@@ -49,7 +74,7 @@ Needs pymavlink for the command line: pip install 'pymavlink>=2.4.50'
 (2.4.49 can crash at connect, a TypeError in mavutil.add_message, when a link
 switches from MAVLink 1 to 2; fixed in 2.4.50).
 """
-import argparse, glob, os, struct, sys, tempfile, time, unicodedata
+import argparse, glob, os, struct, sys, tempfile, time, unicodedata, zlib
 
 # opcodes, GCS_FTP.h FTP_OP
 OP_TERM, OP_RESET, OP_LIST, OP_OPEN_RO, OP_CRC, OP_BURST = 1, 2, 3, 4, 14, 15
@@ -101,12 +126,20 @@ for _i in range(256):
     _TAB.append(_c)
 
 
-def ap_crc32(data):
-    """ArduPilot crc_crc32: reflected 0xEDB88320, init 0, NO final xor (not zlib.crc32)."""
+def _ap_crc32_table(data):
+    """The table-loop form of ap_crc32, kept as the reference the selftest
+    compares the zlib form with (about 35 s on 607 MB; zlib takes a second)."""
     crc = 0
     for b in data:
         crc = _TAB[(crc ^ b) & 0xff] ^ (crc >> 8)
     return crc
+
+
+def ap_crc32(data):
+    """ArduPilot crc_crc32: reflected 0xEDB88320, init 0, NO final xor. Computed
+    as zlib's crc32 with init 0xFFFFFFFF and the final xor undone, which is
+    the same function (zlib.crc32(d, 0xFFFFFFFF) ^ 0xFFFFFFFF), but in C."""
+    return zlib.crc32(data, 0xFFFFFFFF) ^ 0xFFFFFFFF
 
 
 class FtpSession:
@@ -116,7 +149,8 @@ class FtpSession:
     0, which pymavlink leaves unset, accepts any component of the peer system). `stall` is the seconds of silence before a read is
     re-asked; `log` takes one string. `max_bytes` caps one download. `dropped`
     counts replies skipped because they did not come from the heartbeat peer or
-    were not addressed to this connection."""
+    were not addressed to this connection. `stale_crc` counts CalcFileCRC32
+    replies whose seq was not the one crc() is waiting for."""
 
     term_quiet = 3.0   # fetch's closing TerminateSession: seconds of quiet, and
     term_cap = 60      # the longest it waits for the link to go quiet
@@ -127,15 +161,21 @@ class FtpSession:
         self.log = log
         self.max_bytes = max_bytes
         self.dropped = 0
+        self.stale_crc = 0
         self.seq = 0
         self.last_size = 0   # bytes and seconds of the last successful fetch,
         self.last_dt = 0.0   # excluding the closing drain
 
-    def send(self, op, size=0, offset=0, data=b''):
-        self.seq = (self.seq + 1) & 0xffff
-        hdr = struct.pack('<HBBBBBBI', self.seq, 0, op, size, 0, 0, 0, offset)
+    def _xmit(self, seq, op, size, offset, data):
+        """Send one request with the given seq (send() takes the next one;
+        crc() re-sends a stored one)."""
+        hdr = struct.pack('<HBBBBBBI', seq, 0, op, size, 0, 0, 0, offset)
         self.m.mav.file_transfer_protocol_send(
             0, self.m.target_system, self.m.target_component, (hdr + data).ljust(251, b'\0'))
+
+    def send(self, op, size=0, offset=0, data=b''):
+        self.seq = (self.seq + 1) & 0xffff
+        self._xmit(self.seq, op, size, offset, data)
 
     def recv(self, timeout):
         end = time.time() + timeout
@@ -153,8 +193,8 @@ class FtpSession:
             if time.time() >= end:
                 return None
         b = bytes(x.payload).ljust(12, b'\0')
-        _s, _sess, opc, size, req, bc, _, ofs = struct.unpack('<HBBBBBBI', b[:12])
-        return dict(op=opc, size=size, req=req, bc=bc, ofs=ofs, data=b[12:12 + size])
+        seq, _sess, opc, size, req, bc, _, ofs = struct.unpack('<HBBBBBBI', b[:12])
+        return dict(seq=seq, op=opc, size=size, req=req, bc=bc, ofs=ofs, data=b[12:12 + size])
 
     def drain(self, quiet=4.0, limit=180):
         t = time.time(); last = t; n = 0
@@ -215,12 +255,49 @@ class FtpSession:
             if not r['data'].strip(b'\0'):
                 return out
 
-    def crc(self, remote, timeout=60, deadline=None):
-        """The board's CalcFileCRC32 of `remote`, or None."""
-        r = self.ask(OP_CRC, remote, timeout, deadline=deadline)
-        if r and r['op'] == ACK and len(r['data']) >= 4:
-            return struct.unpack('<I', r['data'][:4])[0]
-        return None
+    def crc(self, remote, wait, progress=None):
+        """Ask the board for CalcFileCRC32 of `remote` and wait up to `wait`
+        seconds. Returns (status, value): ('ack', crc) for an ACK with 4 or
+        more data bytes, ('nack', code or None), ('short', None) for an ACK
+        with fewer, ('timeout', None).
+
+        One request, one seq. The FC computes the CRC in its only FTP thread
+        and answers nothing else until it is done, and each request with a new
+        seq makes it compute again (GCS_FTP.cpp, ArduPilot 4.7.1 dbe79216), so
+        a re-ask must reuse the seq: the worker then resends its cached reply
+        (request seq + 1 == cached reply seq) without recomputing. The same
+        request is re-sent at wait/3 and 2*wait/3 for a lost packet. Only a
+        CRC reply with seq == sent seq + 1 is taken; other CRC replies are
+        counted in stale_crc. `progress(elapsed_s)` is called about every 30 s."""
+        enc = remote.encode()
+        self.send(OP_CRC, len(enc), 0, enc)
+        seq = self.seq
+        want = (seq + 1) & 0xffff
+        t0 = time.time()
+        end = t0 + wait
+        resend = [t0 + wait / 3, t0 + 2 * wait / 3]
+        next_progress = t0 + 30
+        while True:
+            now = time.time()
+            if now >= end:
+                return ('timeout', None)
+            if resend and now >= resend[0]:
+                resend.pop(0)
+                self._xmit(seq, OP_CRC, len(enc), 0, enc)
+            if progress is not None and now >= next_progress:
+                progress(now - t0)
+                next_progress += 30
+            r = self.recv(min(0.5, end - now))
+            if r is None or r['req'] != OP_CRC or r['op'] not in (ACK, NACK):
+                continue
+            if r['seq'] != want:
+                self.stale_crc += 1
+                continue
+            if r['op'] == NACK:
+                return ('nack', r['data'][0] if r['data'] else None)
+            if len(r['data']) >= 4:
+                return ('ack', struct.unpack('<I', r['data'][:4])[0])
+            return ('short', None)
 
     def fetch(self, remote, until_eof=False, timeout=None):
         """Read `remote` and return its bytes.
@@ -386,11 +463,20 @@ class _FakeFC:
     read follows BurstReadFile in ArduPilot 4.7.1 (GCS_FTP.cpp): `burst`
     replies per request, a short read sets burst_complete, a read of 0 bytes
     is an EndOfFile NACK whose offset is the reply's last-set offset (0 if no
-    data reply went out yet in the burst)."""
+    data reply went out yet in the burst).
+
+    Every reply carries seq = request seq + 1 (setup_reply). The worker is
+    serial, as in 4.7.1: a CalcFileCRC32 with a new seq costs `crc_delay`
+    seconds, one with the same seq as the last is answered from the cached
+    reply at no cost, and no reply to any request goes out before the work
+    queued ahead of it is done. `crc_nack` (an error code) answers the CRC with
+    a NACK; `stale_crc` puts a CRC ACK with a wrong seq and a wrong value ahead
+    of the real one."""
 
     def __init__(self, content, announced=None, burst=2000, drop=(), swallow=0,
                  stale=0, nack_open=False, inject=(), forge=None, open_data=None,
-                 crc_data=None, listing=None):
+                 crc_data=None, listing=None, crc_delay=0.0, crc_nack=None,
+                 stale_crc=False):
         self.content = content
         self.announced = len(content) if announced is None else announced
         self.burst = burst
@@ -402,6 +488,14 @@ class _FakeFC:
         self.open_data = open_data  # bytes: replaces the OPEN ACK's data
         self.crc_data = crc_data    # bytes: replaces the CRC ACK's data
         self.listing = list(listing or [])  # replies to ListDirectory, one per request: (ACK|NACK, data)
+        self.crc_delay = crc_delay
+        self.crc_nack = crc_nack
+        self.stale_crc = stale_crc
+        self.crc_seqs = []          # the seq of every CRC request, duplicates included
+        self.delayed = []           # (ready_time, packet), in worker order
+        self.worker_free = 0.0
+        self._last_crc_seq = None
+        self._rseq = 0
         self.requests = []          # (op, size, offset) as the tool sent them
         self.nack_offsets = []
         self.q = [self._pkt(ACK, OP_BURST, CH, 0, b'\xaa' * CH) for _ in range(stale)]
@@ -416,34 +510,65 @@ class _FakeFC:
         self.mav = _Mav()
 
     @staticmethod
-    def _pkt(op, req, size, ofs, data=b'', bc=0):
-        hdr = struct.pack('<HBBBBBBI', 0, 0, op, size, req, bc, 0, ofs)
+    def _pkt(op, req, size, ofs, data=b'', bc=0, seq=0):
+        hdr = struct.pack('<HBBBBBBI', seq, 0, op, size, req, bc, 0, ofs)
         return _Msg((hdr + data).ljust(251, b'\0'))
 
+    def _p(self, *a, seq=None):
+        return self._pkt(*a, seq=self._rseq if seq is None else seq)
+
     def recv_match(self, type=None, blocking=True, timeout=None):
+        if self.delayed:
+            now = time.time()
+            while self.delayed and self.delayed[0][0] <= now:
+                self.q.append(self.delayed.pop(0)[1])
         if self.q:
             return self.q.pop(0)
         time.sleep(min(timeout or 0.01, 0.01))
         return None
 
     def _on_request(self, b):
+        seq, _sess, op = struct.unpack('<HBB', b[:4])
+        self._rseq = (seq + 1) & 0xffff
+        now = time.time()
+        start = max(now, self.worker_free)
+        cost = 0.0
+        if op == OP_CRC and self.crc_nack is None:
+            cost = 0.0 if seq == self._last_crc_seq else self.crc_delay
+            self.crc_seqs.append(seq)
+            self._last_crc_seq = seq
+        n0 = len(self.q)
+        self._handle(b)
+        self.worker_free = start + cost
+        if self.worker_free > now + 1e-9:
+            new = self.q[n0:]
+            del self.q[n0:]
+            self.delayed.extend((self.worker_free, p) for p in new)
+
+    def _handle(self, b):
         _s, _sess, op, size, _r, _bc, _z, ofs = struct.unpack('<HBBBBBBI', b[:12])
         self.requests.append((op, size, ofs))
         if op == OP_RESET or op == OP_TERM:
-            self.q.append(self._pkt(ACK, op, 0, 0))
+            self.q.append(self._p(ACK, op, 0, 0))
         elif op == OP_LIST:
             if self.listing:
                 kind, d = self.listing.pop(0)
-                self.q.append(self._pkt(kind, op, len(d), ofs, d))
+                self.q.append(self._p(kind, op, len(d), ofs, d))
         elif op == OP_OPEN_RO:
             if self.nack_open:
-                self.q.append(self._pkt(NACK, op, 2, 0, bytes([10, 0])))
+                self.q.append(self._p(NACK, op, 2, 0, bytes([10, 0])))
             else:
                 d = struct.pack('<I', self.announced) if self.open_data is None else self.open_data
-                self.q.append(self._pkt(ACK, op, len(d), 0, d))
+                self.q.append(self._p(ACK, op, len(d), 0, d))
         elif op == OP_CRC:
+            if self.crc_nack is not None:
+                self.q.append(self._p(NACK, op, 1, 0, bytes([self.crc_nack])))
+                return
+            if self.stale_crc:
+                self.q.append(self._p(ACK, op, 4, 0, struct.pack('<I', 0xdeadbeef),
+                                      seq=(self._rseq + 5) & 0xffff))
             d = struct.pack('<I', ap_crc32(self.content)) if self.crc_data is None else self.crc_data
-            self.q.append(self._pkt(ACK, op, len(d), 0, d))
+            self.q.append(self._p(ACK, op, len(d), 0, d))
         elif op == OP_BURST:
             self.q.extend(self.inject)
             self.inject = []
@@ -456,7 +581,7 @@ class _FakeFC:
                 chunk = self.content[ofs + i * CH: ofs + (i + 1) * CH]
                 if not chunk:
                     self.nack_offsets.append(off)
-                    self.q.append(self._pkt(NACK, op, 1, off, bytes([ERR_EOF]), bc))
+                    self.q.append(self._p(NACK, op, 1, off, bytes([ERR_EOF]), bc))
                     return
                 off = ofs + i * CH
                 bc = 1 if (len(chunk) < CH or i == self.burst - 1) else 0
@@ -464,11 +589,11 @@ class _FakeFC:
                     self.drop.discard(off)
                 else:
                     if self.forge:
-                        bad = _Msg(self._pkt(ACK, op, len(chunk), off, b'\xee' * len(chunk), bc).payload,
+                        bad = _Msg(self._p(ACK, op, len(chunk), off, b'\xee' * len(chunk), bc).payload,
                                    src={'src': (2, 1), 'comp': (1, 2)}.get(self.forge, (1, 1)),
                                    target=(251, 190) if self.forge == 'target' else (250, 190))
                         self.q.append(bad)
-                    self.q.append(self._pkt(ACK, op, len(chunk), off, chunk, bc))
+                    self.q.append(self._p(ACK, op, len(chunk), off, chunk, bc))
                 if len(chunk) < CH:
                     off += len(chunk)
 
@@ -647,6 +772,12 @@ def _selftest():
         assert zlib.crc32(b'123456789') == 0xCBF43926
         assert ap_crc32(b'123456789') != zlib.crc32(b'123456789')
 
+    @case("ap_crc32 (zlib form) equals the table loop on lengths 0 to 100003")
+    def _():
+        for n in (0, 1, 63, 64, 65, 1000, 100003):
+            d = rnd.randbytes(n)
+            assert ap_crc32(d) == _ap_crc32_table(d), n
+
     pkt = _FakeFC._pkt
 
     @case("known size: a chunk at or past the announced size yields no file")
@@ -700,14 +831,14 @@ def _selftest():
         assert not sent(fc, OP_BURST), fc.requests
         assert fc.requests[-1][0] == OP_TERM
 
-    @case("a CRC ACK with an empty payload gives None")
+    @case("a CRC ACK with fewer than 4 data bytes is ('short', None); a full one is ('ack', crc)")
     def _():
         fc = _FakeFC(blob(100), crc_data=b'')
-        assert session(fc).crc('/x') is None
+        assert session(fc).crc('/x', 2) == ('short', None)
         fc = _FakeFC(blob(100), crc_data=b'\x01\x02')
-        assert session(fc).crc('/x') is None
+        assert session(fc).crc('/x', 2) == ('short', None)
         data = blob(100)
-        assert session(_FakeFC(data)).crc('/x') == ap_crc32(data)
+        assert session(_FakeFC(data)).crc('/x', 2) == ('ack', ap_crc32(data))
 
     @case("an OPEN ACK with an empty payload raises FtpOpenError")
     def _():
@@ -941,6 +1072,180 @@ def _selftest():
         finally:
             shutil.rmtree(d)
 
+    # ---- CalcFileCRC32: one request, one seq (the FC recomputes per new seq)
+
+    import contextlib
+    import io
+    import shutil
+    import types
+
+    def run_get(fc, timeout=30, crc_wait=5, no_crc=False, data=None):
+        """The CLI path (_run) on the fake: (exit code, output, files in the
+        output directory, the directory's contents by name)."""
+        d = tempfile.mkdtemp()
+        try:
+            a = types.SimpleNamespace(list=None, last_log=None, remote='/x', local=os.path.join(d, 'out.BIN'),
+                                      timeout=timeout, crc_wait=crc_wait, no_crc=no_crc)
+            s = session(fc)
+            real_drain = s.drain
+            s.drain = lambda quiet=4.0, limit=180: real_drain(0.05, 5)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    code = _run(a, s)
+                except SystemExit as e:
+                    code = e.code
+            files = {n: open(os.path.join(d, n), 'rb').read() for n in os.listdir(d)}
+            return code, buf.getvalue(), files
+        finally:
+            shutil.rmtree(d)
+
+    @case("crc(): a CRC slower than the wait gives ('timeout', None) and one distinct seq")
+    def _():
+        fc = _FakeFC(blob(100), crc_delay=1.5)
+        t = time.time()
+        assert session(fc).crc('/x', 0.6) == ('timeout', None)
+        assert 0.55 <= time.time() - t < 1.2
+        assert len(set(fc.crc_seqs)) == 1 and 1 <= len(fc.crc_seqs) <= 3, fc.crc_seqs
+
+    @case("crc(): a lost request is re-sent with the same seq and answered (no second computation)")
+    def _():
+        fc = _FakeFC(blob(100), crc_delay=0.0)
+        s = session(fc)
+        n = [0]
+        send = fc.mav.file_transfer_protocol_send
+
+        def lossy(net, sysid, comp, payload):
+            n[0] += 1
+            if n[0] > 1:
+                send(net, sysid, comp, payload)
+        fc.mav.file_transfer_protocol_send = lossy
+        assert s.crc('/x', 1.5) == ('ack', ap_crc32(fc.content))
+        assert len(set(fc.crc_seqs)) == 1, fc.crc_seqs
+
+    @case("crc(): a CRC ACK with the wrong seq ahead of the real one is ignored and counted")
+    def _():
+        data = blob(100)
+        fc = _FakeFC(data, stale_crc=True)
+        s = session(fc)
+        assert s.crc('/x', 2) == ('ack', ap_crc32(data))
+        assert s.stale_crc == 1 and s.dropped == 0, (s.stale_crc, s.dropped)
+
+    @case("crc(): the reply seq is the sent seq + 1 modulo 65536")
+    def _():
+        data = blob(100)
+        fc = _FakeFC(data)
+        s = session(fc)
+        s.seq = 0xfffe
+        assert s.crc('/x', 2) == ('ack', ap_crc32(data))
+        assert fc.crc_seqs == [0xffff], fc.crc_seqs
+        assert s.stale_crc == 0
+
+    @case("crc(): a NACK gives ('nack', code)")
+    def _():
+        assert session(_FakeFC(blob(10), crc_nack=2)).crc('/x', 2) == ('nack', 2)
+
+    @case("get: CRC slower than --crc-wait: exit 3, bytes kept as .unverified, UNVERIFIED not MISMATCH")
+    def _():
+        data = blob(3000)
+        fc = _FakeFC(data, crc_delay=2.0)
+        code, out, files = run_get(fc, crc_wait=0.6)
+        assert code == 3, (code, out)
+        assert files == {'out.BIN.unverified': data}, sorted(files)
+        assert 'UNVERIFIED' in out and 'MISMATCH' not in out, out
+        assert 'stays busy' in out and hex(ap_crc32(data)) in out, out
+        assert len(set(fc.crc_seqs)) == 1, fc.crc_seqs
+        assert fc.requests[-1][0] == OP_TERM
+
+    @case("get: CRC faster than --crc-wait (default wait): VERIFIED, exit 0, no .unverified left")
+    def _():
+        data = blob(3000)
+        fc = _FakeFC(data, crc_delay=0.3)
+        code, out, files = run_get(fc, crc_wait=None)
+        assert code == 0, (code, out)
+        assert files == {'out.BIN': data}, sorted(files)
+        assert f"VERIFIED: CRC {hex(ap_crc32(data))} matches the board" in out, out
+        assert 'waiting up to 120 s' in out, out
+
+    @case("get: a wrong CRC from the board: MISMATCH with both values, exit 1, kept as .crc-mismatch")
+    def _():
+        data = blob(3000)
+        fc = _FakeFC(data, crc_data=struct.pack('<I', 0x12345678))
+        code, out, files = run_get(fc)
+        assert code == 1, (code, out)
+        assert files == {'out.BIN.crc-mismatch': data}, sorted(files)
+        assert f"CRC MISMATCH: board 0x12345678, local {hex(ap_crc32(data))}" in out, out
+
+    @case("get: a NACKed CRC: UNVERIFIED naming the code, exit 3")
+    def _():
+        data = blob(3000)
+        code, out, files = run_get(_FakeFC(data, crc_nack=2))
+        assert code == 3, (code, out)
+        assert 'UNVERIFIED' in out and 'FailErrno (code 2)' in out and 'MISMATCH' not in out, out
+        assert files == {'out.BIN.unverified': data}, sorted(files)
+
+    @case("get: a short CRC reply: UNVERIFIED, exit 3, never MISMATCH")
+    def _():
+        data = blob(3000)
+        code, out, files = run_get(_FakeFC(data, crc_data=b'\x01'))
+        assert code == 3 and 'UNVERIFIED' in out and 'short' in out and 'MISMATCH' not in out, (code, out)
+        assert list(files) == ['out.BIN.unverified']
+
+    @case("get: a stale CRC ACK ahead of the real one is ignored: VERIFIED")
+    def _():
+        data = blob(3000)
+        code, out, files = run_get(_FakeFC(data, stale_crc=True))
+        assert code == 0 and files == {'out.BIN': data}, (code, out, sorted(files))
+
+    @case("get --no-crc: no CRC request is sent, exit 3, bytes kept as .unverified")
+    def _():
+        data = blob(3000)
+        fc = _FakeFC(data)
+        code, out, files = run_get(fc, no_crc=True)
+        assert code == 3 and 'UNVERIFIED' in out and '--no-crc' in out, (code, out)
+        assert files == {'out.BIN.unverified': data}, sorted(files)
+        assert not sent(fc, OP_CRC) and fc.crc_seqs == []
+
+    @case("get: --timeout bounds the download only; a CRC slower than --timeout still verifies")
+    def _():
+        data = blob(3000)
+        fc = _FakeFC(data, crc_delay=2.5)
+        code, out, files = run_get(fc, timeout=2, crc_wait=8)
+        assert code == 0 and files == {'out.BIN': data}, (code, out, sorted(files))
+
+    @case("--crc-wait must be above 0")
+    def _():
+        buf = io.StringIO()
+        for bad in ('0', '-3'):
+            with contextlib.redirect_stderr(buf):
+                try:
+                    main(['--crc-wait', bad, '/x', 'out/y'])
+                except SystemExit as e:
+                    assert e.code == 2, e.code
+                else:
+                    raise AssertionError("accepted")
+        assert '--crc-wait must be above 0' in buf.getvalue()
+
+    @case("output files: a planted <local>.unverified symlink is replaced, not written through; rename onto a planted .crc-mismatch link too")
+    def _():
+        d = tempfile.mkdtemp()
+        try:
+            victim = os.path.join(d, 'victim')
+            open(victim, 'wb').write(b'keep')
+            local = os.path.join(d, 'out.BIN')
+            for suffix in ('.unverified', '.crc-mismatch'):
+                os.symlink(victim, local + suffix)
+            _write_atomic(local + '.unverified', b'u1')
+            assert not os.path.islink(local + '.unverified')
+            _write_atomic(local + '.unverified', b'u2')       # a stale one is simply overwritten
+            os.replace(local + '.unverified', local + '.crc-mismatch')
+            assert not os.path.islink(local + '.crc-mismatch')
+            assert open(local + '.crc-mismatch', 'rb').read() == b'u2'
+            assert open(victim, 'rb').read() == b'keep'
+            assert sorted(os.listdir(d)) == ['out.BIN.crc-mismatch', 'victim']
+        finally:
+            shutil.rmtree(d)
+
     bad = results.count(False)
     print(f"{len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
@@ -985,7 +1290,11 @@ def wait_autopilot(m, timeout):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap = argparse.ArgumentParser(
+        description=__doc__.split('\n\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="exit codes: 0 VERIFIED (or a listing); 1 failure or CRC MISMATCH; "
+               "3 UNVERIFIED (the board gave no CRC, refused it, or --no-crc: the bytes are kept "
+               "in LOCAL.unverified)")
     ap.add_argument('remote', nargs='?', help='file on the FC, e.g. /APM/LOGS/00000011.BIN')
     ap.add_argument('local', nargs='?', help='where to write it (a directory keeps the remote name)')
     ap.add_argument('--list', metavar='DIR', help='list a directory on the FC and exit')
@@ -996,8 +1305,13 @@ def main(argv=None):
     ap.add_argument('--max-mib', type=int, default=MAX_BYTES >> 20,
                     help='refuse a file larger than this many MiB (default 2048)')
     ap.add_argument('--timeout', type=float, default=600.0, metavar='S',
-                    help='seconds allowed for one download, --last-log included (default 600); '
-                         'not applied to --list')
+                    help='seconds allowed for the download, --last-log included (default 600); '
+                         'not applied to --list or to the CRC wait (see --crc-wait)')
+    ap.add_argument('--crc-wait', type=float, default=None, metavar='S',
+                    help="seconds to wait for the board's CRC after the download "
+                         "(default: the larger of 120 and twice the download's seconds)")
+    ap.add_argument('--no-crc', action='store_true',
+                    help="do not ask for the board's CRC: write LOCAL.unverified and exit 3")
     ap.add_argument('--selftest', action='store_true', help='run the offline tests and exit')
     a = ap.parse_args(argv)
     if a.selftest:
@@ -1006,6 +1320,8 @@ def main(argv=None):
         ap.error('give REMOTE LOCAL, --list DIR or --last-log DIR')
     if not a.timeout > 0:
         ap.error('--timeout must be above 0')
+    if a.crc_wait is not None and not a.crc_wait > 0:
+        ap.error('--crc-wait must be above 0')
 
     try:
         from pymavlink import mavutil
@@ -1070,19 +1386,39 @@ def _run(a, s):
             sys.exit(str(e))
         size, dt = s.last_size, s.last_dt
         print(f"got {size} bytes in {dt:.1f} s, {size / max(dt, 1e-3) / 1024:.1f} KiB/s", flush=True)
-        left = deadline - time.time()
-        if left <= 0:
-            s.terminate(drain=False)
-            sys.exit(f"{inert(remote)}: --timeout {a.timeout:g} s passed before the CRC check")
-        board = s.crc(remote, timeout=min(60, max(left / 3, 1)), deadline=deadline)
         local_crc = ap_crc32(buf)
+        # Keep the download before the long wait: a Ctrl-C or a dropped tunnel
+        # then costs only the check, not the transfer.
+        unv = local + '.unverified'
+        _write_atomic(unv, buf)
+        if a.no_crc:
+            print(f"UNVERIFIED: --no-crc, the board's CRC was not asked for; local CRC {hex(local_crc)}; "
+                  f"kept as {unv}", flush=True)
+            return 3
+        wait = a.crc_wait if a.crc_wait is not None else max(120.0, 2 * dt)
+        print(f"asking the board for its CRC; waiting up to {wait:.0f} s", flush=True)
+        status, val = s.crc(remote, wait, progress=lambda n: print(
+            f"  waiting for the board's CRC, {n:.0f} s (MAVFTP on the FC is busy until it answers)", flush=True))
         s.terminate(drain=False)
-        if board != local_crc:
+        if status == 'ack' and val == local_crc:
+            os.replace(unv, local)
+            print(f"VERIFIED: CRC {hex(local_crc)} matches the board; wrote {local}")
+            return 0
+        if status == 'ack':
             bad = local + '.crc-mismatch'
-            _write_atomic(bad, buf)
-            sys.exit(f"CRC MISMATCH: board {board and hex(board)}, local {hex(local_crc)}; kept as {bad}")
-        _write_atomic(local, buf)
-        print(f"VERIFIED: CRC {hex(local_crc)} matches the board; wrote {local}")
+            os.replace(unv, bad)
+            print(f"CRC MISMATCH: board {hex(val)}, local {hex(local_crc)}; kept as {bad}", file=sys.stderr)
+            return 1
+        if status == 'timeout':
+            why = (f"the board gave no CRC within {wait:.0f} s. The FC's MAVFTP stays busy until its CRC "
+                   f"finishes, which may take as long again: wait before the next MAVFTP command")
+        elif status == 'nack':
+            why = ("the board refused the CRC: no error code" if val is None else
+                   f"the board refused the CRC: {FTP_ERR.get(val, 'unknown')} (code {val})")
+        else:
+            why = "the board's CRC reply was short"
+        print(f"UNVERIFIED: {why}; local CRC {hex(local_crc)}; kept as {unv}", flush=True)
+        return 3
 
     n, dt = s.reset()
     print(f"sessions reset; drained {n} stale replies in {dt:.1f} s", flush=True)
@@ -1126,8 +1462,7 @@ def _run(a, s):
     local = a.local
     if os.path.isdir(local):
         local = os.path.join(local, os.path.basename(a.remote))
-    get(a.remote, local)
-    return 0
+    return get(a.remote, local)
 
 
 if __name__ == '__main__':

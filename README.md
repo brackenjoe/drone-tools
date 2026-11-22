@@ -177,6 +177,8 @@ flight controller its own system id (`MAV_SYSID` from Copter 4.7,
     ap-ftp-get.py --list /APM/LOGS
     ap-ftp-get.py --last-log out/        # the log LASTLOG.TXT names
     ap-ftp-get.py ... --device /dev/ttyACM0 --baud 115200 --stall 5 --max-mib 2048 --timeout 600
+    ap-ftp-get.py ... --crc-wait 900     # a long CRC wait for a large log
+    ap-ftp-get.py ... --no-crc           # skip the CRC; keeps LOCAL.unverified, exit 3
     ap-ftp-get.py --selftest             # offline, stdlib only
 
 A directory given with a trailing `/`, or to `--last-log`, is created if
@@ -193,12 +195,40 @@ authentication. It stores a chunk only if the chunk lies inside the size the
 board announced, starts on a 239-byte boundary and carries as many bytes as
 its header says, and it refuses a file larger than `--max-mib`. Memory
 grows with the chunks it accepts, not with the size announced (the final join briefly needs about twice the file size), and a
-download gives up after `--timeout` seconds (default 600). `VERIFIED` means the board's CRC32 matches the bytes
-received. That catches a corrupted transfer, but the CRC comes over the same
-link, so it does not prove the source. MAVLink signing would, and this tool
-neither signs nor checks signatures. On a CRC mismatch, or no CRC reply at
-all, the bytes are kept beside the target as `.crc-mismatch`. A --timeout reached before the CRC check keeps nothing. Both files are
-written to a temporary name in the same directory and then renamed. File
+download gives up after `--timeout` seconds (default 600), which keeps nothing.
+
+After the download the tool asks the board for the file's CRC32 once. `LOCAL`
+below is the path given, or the remote file's name inside a directory given;
+an existing file of that name is replaced. In ArduPilot 4.7.1 (read from the
+source) the board computes the CRC by reading the whole file in its MAVFTP
+thread, which answers nothing else meanwhile. A new CRC request does not
+interrupt that: it is queued and reads the whole file again after the current
+one, so each adds as long again; a repeat of the same request is answered from
+the cached reply. So the tool repeats only the same request. How long a large
+log on an SD card takes is not measured on hardware: one 218 MB log got no
+answer within 180 s. The default wait, `--crc-wait`, is the larger of 120 s and
+twice the download time, a guess until that rate is measured. The bytes are
+written to `LOCAL.unverified` before the request. Then:
+
+- `VERIFIED`: the board's CRC32 matches the bytes received; the file is renamed
+  to `LOCAL`; exit 0.
+- `MISMATCH`: the board answered with a different CRC32; the file is renamed to
+  `LOCAL.crc-mismatch`; exit 1. Exit 1 also means any other failure (a
+  `--timeout`, a failed open, no heartbeat, a usage error); only a
+  `CRC MISMATCH` line means the `.crc-mismatch` file exists.
+- `UNVERIFIED`: no answer within the wait, a refusal, a short reply, or
+  `--no-crc`; the file stays `LOCAL.unverified`; exit 3. It says nothing about
+  the bytes either way. After a timed-out request the board's MAVFTP stays busy
+  until its computation finishes, so wait before the next MAVFTP command; one
+  sent at once queues behind it and looks hung.
+
+A file the board is still writing, such as the current log (`--last-log` while
+logging is on), will usually come out `MISMATCH`, since the board's CRC covers
+what it has written by then; use `--no-crc` for it. A match catches a corrupted
+transfer, but the CRC comes over the same link, so it does not prove the
+source. MAVLink signing would, and this tool neither signs nor checks
+signatures. Every file is written to a temporary name in the same directory and
+then renamed. File
 names in `--list` output are printed with control characters shown as
 `\xNN` text.
 
